@@ -257,5 +257,184 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertEqual(summary.stdout, "")
 
 
+class BillingReconcileTests(unittest.TestCase):
+    """End-to-end checks for the billing-cycle reconciliation detail."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def reconcile(self, customer_id: str, plan: str, start: str, end: str):
+        return self.invoke(
+            "billing", "reconcile",
+            "--customer-id", customer_id, "--plan", plan,
+            "--start-date", start, "--end-date", end,
+        )
+
+    def create_subscription(self, customer_id: str = "c1", plan: str = "basic"):
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", "990",
+            "--start-date", "2026-01-05",
+        )
+
+    def record(self, day: str, quantity: str, customer_id: str = "c1", plan: str = "basic"):
+        return self.invoke(
+            "usage", "record",
+            "--customer-id", customer_id, "--plan", plan,
+            "--usage-date", day, "--quantity", quantity,
+        )
+
+    def test_full_period_report_shape_and_totals(self) -> None:
+        create = self.create_subscription()
+        self.assertEqual(create.returncode, 0, create.stderr)
+        subscription_id = json.loads(create.stdout)["id"]
+
+        for day, quantity in [("2026-01-06", "5"), ("2026-01-06", "3"),
+                             ("2026-01-08", "0"), ("2026-01-10", "2")]:
+            result = self.record(day, quantity)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        result = self.reconcile("c1", "basic", "2026-01-04", "2026-01-11")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+
+        self.assertEqual(
+            report,
+            {
+                "subscription_id": subscription_id,
+                "period_start": "2026-01-04",
+                "period_end": "2026-01-11",
+                "days": [
+                    {"usage_date": "2026-01-04", "total": 0, "missing": True},
+                    {"usage_date": "2026-01-05", "total": 0, "missing": True},
+                    {"usage_date": "2026-01-06", "total": 8, "missing": False},
+                    {"usage_date": "2026-01-07", "total": 0, "missing": True},
+                    # A zero-quantity record still makes the day present.
+                    {"usage_date": "2026-01-08", "total": 0, "missing": False},
+                    {"usage_date": "2026-01-09", "total": 0, "missing": True},
+                    {"usage_date": "2026-01-10", "total": 2, "missing": False},
+                    {"usage_date": "2026-01-11", "total": 0, "missing": True},
+                ],
+                "cycle_total": 10,
+                "coverage": {"present_days": 3, "missing_days": 5},
+            },
+        )
+
+        dates = [day["usage_date"] for day in report["days"]]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual(
+            report["coverage"]["present_days"] + report["coverage"]["missing_days"],
+            len(report["days"]),
+        )
+        self.assertEqual(
+            report["cycle_total"], sum(day["total"] for day in report["days"])
+        )
+
+    def test_dates_before_subscription_start_are_listed_as_missing(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        result = self.reconcile("c1", "basic", "2025-12-31", "2026-01-05")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(len(report["days"]), 6)
+        self.assertEqual(report["days"][0],
+                         {"usage_date": "2025-12-31", "total": 0, "missing": True})
+        self.assertTrue(all(day["missing"] for day in report["days"]))
+        self.assertEqual(report["cycle_total"], 0)
+        self.assertEqual(report["coverage"], {"present_days": 0, "missing_days": 6})
+
+    def test_single_day_period_inclusive_endpoints(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+
+        present = self.reconcile("c1", "basic", "2026-01-06", "2026-01-06")
+        self.assertEqual(present.returncode, 0, present.stderr)
+        report = json.loads(present.stdout)
+        self.assertEqual(
+            report["days"],
+            [{"usage_date": "2026-01-06", "total": 0, "missing": True}],
+        )
+        self.assertEqual(report["coverage"], {"present_days": 0, "missing_days": 1})
+
+        self.assertEqual(self.record("2026-01-06", "7").returncode, 0)
+        filled = self.reconcile("c1", "basic", "2026-01-06", "2026-01-06")
+        report = json.loads(filled.stdout)
+        self.assertEqual(
+            report["days"],
+            [{"usage_date": "2026-01-06", "total": 7, "missing": False}],
+        )
+        self.assertEqual(report["cycle_total"], 7)
+        self.assertEqual(report["coverage"], {"present_days": 1, "missing_days": 0})
+
+    def test_invalid_dates_and_reversed_range_exit_2(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+
+        for start, end in [
+            ("not-a-date", "2026-01-10"),
+            ("2026-02-30", "2026-01-10"),
+            ("2026-01-01", "2026-13-01"),
+            ("2026-01-10", "2026-01-01"),
+        ]:
+            with self.subTest(start=start, end=end):
+                result = self.reconcile("c1", "basic", start, end)
+                self.assertEqual(result.returncode, 2)
+                self.assertNotEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+
+    def test_unknown_subscription_exits_4(self) -> None:
+        result = self.reconcile("ghost", "basic", "2026-01-01", "2026-01-31")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_query_is_scoped_to_subscription(self) -> None:
+        self.assertEqual(self.create_subscription("c1", "basic").returncode, 0)
+        self.assertEqual(self.create_subscription("c2", "pro").returncode, 0)
+        self.assertEqual(self.record("2026-01-06", "9", "c1", "basic").returncode, 0)
+
+        c1 = self.reconcile("c1", "basic", "2026-01-05", "2026-01-07")
+        c2 = self.reconcile("c2", "pro", "2026-01-05", "2026-01-07")
+        self.assertEqual(json.loads(c1.stdout)["cycle_total"], 9)
+        self.assertEqual(json.loads(c2.stdout)["cycle_total"], 0)
+        self.assertTrue(all(day["missing"] for day in json.loads(c2.stdout)["days"]))
+
+    def test_query_is_read_only(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        result = self.reconcile("c1", "basic", "2026-01-01", "2026-01-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        import sqlite3
+
+        with sqlite3.connect(self.db_path) as connection:
+            usage_count = int(
+                connection.execute("SELECT COUNT(*) FROM usage_records").fetchone()[0]
+            )
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        self.assertEqual(usage_count, 0)
+        self.assertEqual(tables, {"subscriptions", "usage_records", "sqlite_sequence"})
+
+
 if __name__ == "__main__":
     unittest.main()

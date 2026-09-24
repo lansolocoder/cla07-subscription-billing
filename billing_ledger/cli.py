@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import subscriptions, usage
+from . import billing, subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -69,6 +69,17 @@ def _build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--start-date", help="开始日期（含），YYYY-MM-DD，缺省覆盖全部历史.")
     summary.add_argument("--end-date", help="结束日期（含），YYYY-MM-DD，缺省覆盖全部历史.")
 
+    billing_parser = subparsers.add_parser("billing", help="按计费周期生成用量对账明细.")
+    billing_subparsers = billing_parser.add_subparsers(dest="billing_command")
+
+    reconcile = billing_subparsers.add_parser(
+        "reconcile", help="生成某订阅某计费周期的用量对账明细（只读）."
+    )
+    reconcile.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    reconcile.add_argument("--plan", required=True, help="订阅计划，非空.")
+    reconcile.add_argument("--start-date", required=True, help="周期开始日期（含），YYYY-MM-DD.")
+    reconcile.add_argument("--end-date", required=True, help="周期结束日期（含），YYYY-MM-DD.")
+
     return parser
 
 
@@ -124,6 +135,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return usage.list_records(customer_id=args.customer_id, plan=args.plan)
         if args.usage_command == "summary":
             return usage.summary(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+
+    if args.command == "billing":
+        if args.billing_command == "reconcile":
+            return billing.reconcile(
                 customer_id=args.customer_id,
                 plan=args.plan,
                 start_date=args.start_date,

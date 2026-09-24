@@ -68,5 +68,24 @@ python3 -m billing_ledger usage summary --customer-id c1 --plan basic \
   --start-date 2026-01-10 --end-date 2026-01-31
 ```
 
+## 按计费周期对账
+
+```bash
+# 生成该订阅在闭区间周期内（含端点）的用量对账明细，单行紧凑 JSON；只读，不产生任何写入
+python3 -m billing_ledger billing reconcile --customer-id c1 --plan basic \
+  --start-date 2026-01-01 --end-date 2026-01-31
+# {"subscription_id":1,"period_start":"2026-01-01","period_end":"2026-01-31","days":[...],"cycle_total":8,"coverage":{"present_days":2,"missing_days":29}}
+```
+
+- `subscription_id` 为订阅登记时分配的整数 id；`period_start`、`period_end` 原样回显。
+- `days` 按 `usage_date` 升序，周期内每个日期都出现：有用量记录的日期 `total` 为同日多条
+  用量按现有规则求和、`missing` 为 false；无任何用量记录的日期 `total` 为 0、`missing` 为 true。
+  仅含数量 0 的记录仍算"有记录"（`missing` 为 false）。
+- `cycle_total` 为周期内全部日期 `total` 之和；`coverage.present_days + missing_days`
+  恒等于周期内日期总数。
+- 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；找不到匹配的
+  `customer_id` 与 `plan` 订阅组合：stderr、退出码 4。
+- 周期起止与订阅 `start_date` 互不约束：早于订阅开始日期的日期照常出现在 `days` 中并标记缺失。
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
-尚未实现账单生成以及收款核对与差异归集。
+尚未实现收款核对与差异归集。
