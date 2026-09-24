@@ -17,12 +17,53 @@ python3 -m unittest discover -s tests -v
 
 ```bash
 # 登记一条订阅（start_date 须为合法 YYYY-MM-DD 且不晚于今天 UTC）
+# --trial-days 与 --trial-end-date 必须且只能给一个；--trial-days 0 表示无试用
 python3 -m billing_ledger subscription create \
-  --customer-id c1 --plan basic --price-cents 990 --start-date 2026-01-01
+  --customer-id c1 --plan basic --price-cents 990 --start-date 2026-01-01 \
+  --trial-days 0
 
+# 登记一条带试用的订阅：试用区间 [start_date, start_date+trial_days-1]，
+# 转正日期为 start_date+trial_days
+python3 -m billing_ledger subscription create \
+  --customer-id c2 --plan pro --price-cents 1990 --start-date 2026-09-20 \
+  --trial-days 14
+
+# 或以显式日期指定：试用区间 [start_date, trial_end_date]（含端点），
+# 转正日期为 trial_end_date+1；trial_end_date 须不早于 start_date 且不早于今天 UTC
+python3 -m billing_ledger subscription create \
+  --customer-id c3 --plan pro --price-cents 1990 --start-date 2026-09-20 \
+  --trial-end-date 2026-10-04
+```
+
+- 无试用（`--trial-days 0`）时状态为 `active`，转正日期等于 `start_date`；
+  有试用时状态为 `trial`，转正日期持久化保存。
+- 两者同时给出或都不给出：stderr、退出码 2，不写入数据。
+- 重复登记同一 `customer_id` 与 `plan` 组合：stderr、退出码 3，不覆盖已有订阅。
+
+```bash
 # 列出全部订阅（单行 JSON 数组）
 python3 -m billing_ledger subscription list
 ```
+
+## 试用期查询与转正
+
+```bash
+# 输出一行紧凑 JSON；无试用时 trial_days 为 0、trial_end_date 为 null
+python3 -m billing_ledger subscription trial --customer-id c2 --plan pro
+# {"customer_id":"c2","plan":"pro","start_date":"2026-09-20","trial_days":14,
+#  "trial_end_date":"2026-10-03","trial_to_active_date":"2026-10-04","status":"trial"}
+
+# 试用转正：--as-of 缺省为今天 UTC；不早于转正日期时状态变为 active
+python3 -m billing_ledger subscription activate --customer-id c2 --plan pro \
+  --as-of 2026-10-04
+# {"customer_id":"c2","plan":"pro","status":"active","activated_on":"2026-10-04"}
+```
+
+- `--as-of` 早于转正日期：stderr、退出码 2，不写入数据。
+- 找不到匹配的 `customer_id` 与 `plan` 订阅组合：stderr、退出码 4。
+- 无试用的订阅（已为 `active`，转正日期等于 `start_date`）在不早于该日期的
+  `--as-of` 下调用 `activate` 保持 `active` 并输出结果。
+
 
 ## 用量录入
 

@@ -36,9 +36,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--price-cents", required=True, type=_non_negative_int, help="价格，单位分，非负整数."
     )
     create.add_argument("--start-date", required=True, help="开始日期，YYYY-MM-DD.")
-    create.add_argument("--trial-days", type=int, default=0, help="试用天数，0 表示无试用，缺省 0.")
+    create.add_argument(
+        "--trial-days",
+        type=_non_negative_int,
+        default=None,
+        help="试用天数（非负整数，0 表示无试用）；与 --trial-end-date 二选一.",
+    )
+    create.add_argument(
+        "--trial-end-date",
+        default=None,
+        help="试用结束日期（含），YYYY-MM-DD；与 --trial-days 二选一.",
+    )
 
     subscription_subparsers.add_parser("list", help="列出全部订阅.")
+
+    trial = subscription_subparsers.add_parser("trial", help="查询一条订阅的试用期信息.")
+    trial.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    trial.add_argument("--plan", required=True, help="订阅计划，非空.")
+
+    activate = subscription_subparsers.add_parser("activate", help="试用订阅转正.")
+    activate.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    activate.add_argument("--plan", required=True, help="订阅计划，非空.")
+    activate.add_argument(
+        "--as-of",
+        default=None,
+        help="转正生效日期，YYYY-MM-DD，缺省为今天 UTC；不得早于转正日期.",
+    )
 
     usage_parser = subparsers.add_parser("usage", help="登记与查询用量.")
     usage_subparsers = usage_parser.add_subparsers(dest="usage_command")
@@ -112,9 +135,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 price_cents=args.price_cents,
                 start_date=args.start_date,
                 trial_days=args.trial_days,
+                trial_end_date=args.trial_end_date,
             )
         if args.subscription_command == "list":
             return subscriptions.list_all()
+        if args.subscription_command == "trial":
+            return subscriptions.trial_info(
+                customer_id=args.customer_id, plan=args.plan
+            )
+        if args.subscription_command == "activate":
+            return subscriptions.activate(
+                customer_id=args.customer_id, plan=args.plan, as_of=args.as_of
+            )
 
     if args.command == "usage":
         if args.usage_command == "record":

@@ -74,6 +74,7 @@ class UsageLedgerTests(unittest.TestCase):
             "--plan", plan,
             "--price-cents", "990",
             "--start-date", start_date,
+            "--trial-days", "0",
         )
 
     def test_record_requires_existing_subscription(self) -> None:
@@ -287,6 +288,7 @@ class ReconcileTests(unittest.TestCase):
             "--plan", plan,
             "--price-cents", "990",
             "--start-date", start_date,
+            "--trial-days", "0",
         )
 
     def record(self, usage_date: str, quantity: int) -> None:
@@ -387,6 +389,220 @@ class ReconcileTests(unittest.TestCase):
         result = self.reconcile("--start-date", "2026-01-01", "--end-date", "2026-01-31")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.db_path.read_bytes(), before)
+
+
+class TrialManagementTests(unittest.TestCase):
+    """End-to-end checks for trial registration, querying and activation."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create(self, *extra: str, customer_id: str = "c1", plan: str = "basic",
+               start_date: str = "2026-01-01") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", "990",
+            "--start-date", start_date,
+            *extra,
+        )
+
+    def trial(self, customer_id: str = "c1", plan: str = "basic") -> subprocess.CompletedProcess[str]:
+        return self.invoke("subscription", "trial", "--customer-id", customer_id, "--plan", plan)
+
+    def activate(self, *extra: str, customer_id: str = "c1",
+                 plan: str = "basic") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "activate",
+            "--customer-id", customer_id, "--plan", plan, *extra,
+        )
+
+    def test_trial_days_zero_means_no_trial(self) -> None:
+        result = self.create("--trial-days", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["trial_days"], 0)
+        self.assertIsNone(record["trial_end_date"])
+        self.assertEqual(record["trial_to_active_date"], "2026-01-01")
+
+        info = json.loads(self.trial().stdout)
+        self.assertEqual(
+            info,
+            {
+                "customer_id": "c1",
+                "plan": "basic",
+                "start_date": "2026-01-01",
+                "trial_days": 0,
+                "trial_end_date": None,
+                "trial_to_active_date": "2026-01-01",
+                "status": "active",
+            },
+        )
+        self.assertEqual(len(self.trial().stdout.splitlines()), 1)
+
+    def test_trial_days_positive_sets_inclusive_interval(self) -> None:
+        result = self.create("--trial-days", "14")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["status"], "trial")
+        self.assertEqual(record["trial_days"], 14)
+        self.assertEqual(record["trial_end_date"], "2026-01-14")
+        self.assertEqual(record["trial_to_active_date"], "2026-01-15")
+
+        info = json.loads(self.trial().stdout)
+        self.assertEqual(info["trial_end_date"], "2026-01-14")
+        self.assertEqual(info["trial_to_active_date"], "2026-01-15")
+        self.assertEqual(info["status"], "trial")
+
+    def test_trial_end_date_sets_interval_and_derives_days(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        today = datetime.now(timezone.utc).date()
+        start = today - timedelta(days=13)  # 14 inclusive trial days
+        result = self.create(
+            "--trial-end-date", today.isoformat(),
+            start_date=start.isoformat(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["status"], "trial")
+        self.assertEqual(record["trial_days"], 14)
+        self.assertEqual(record["trial_end_date"], today.isoformat())
+        self.assertEqual(
+            record["trial_to_active_date"],
+            (today + timedelta(days=1)).isoformat(),
+        )
+
+        info = json.loads(self.trial().stdout)
+        self.assertEqual(info["trial_days"], 14)
+        self.assertEqual(info["trial_end_date"], today.isoformat())
+        self.assertEqual(info["trial_to_active_date"],
+                         (today + timedelta(days=1)).isoformat())
+
+    def test_exactly_one_trial_specifier_required(self) -> None:
+        neither = self.create()
+        self.assertEqual(neither.returncode, 2)
+        self.assertEqual(neither.stdout, "")
+        self.assertIn("exactly one", neither.stderr)
+
+        both = self.create("--trial-days", "7", "--trial-end-date", "2026-09-25")
+        self.assertEqual(both.returncode, 2)
+        self.assertEqual(both.stdout, "")
+        self.assertIn("exactly one", both.stderr)
+
+        negative = self.create("--trial-days", "-1")
+        self.assertEqual(negative.returncode, 2)
+        self.assertEqual(negative.stdout, "")
+
+        # Nothing was written by any failed attempt.
+        self.assertEqual(json.loads(self.invoke("subscription", "list").stdout), [])
+
+    def test_trial_end_date_validation(self) -> None:
+        bad_format = self.create("--trial-end-date", "2026-10-xx", start_date="2026-09-20")
+        self.assertEqual(bad_format.returncode, 2)
+        self.assertEqual(bad_format.stdout, "")
+
+        before_start = self.create(
+            "--trial-end-date", "2026-09-19", start_date="2026-09-20"
+        )
+        self.assertEqual(before_start.returncode, 2)
+        self.assertIn("start_date", before_start.stderr)
+        self.assertEqual(before_start.stdout, "")
+
+        before_today = self.create(
+            "--trial-end-date", "2000-01-01", start_date="2000-01-01"
+        )
+        self.assertEqual(before_today.returncode, 2)
+        self.assertIn("today", before_today.stderr)
+        self.assertEqual(before_today.stdout, "")
+
+        self.assertEqual(json.loads(self.invoke("subscription", "list").stdout), [])
+
+    def test_duplicate_creation_exits_3_without_overwriting(self) -> None:
+        first = self.create("--trial-days", "14")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        duplicate = self.create("--trial-days", "0")
+        self.assertEqual(duplicate.returncode, 3)
+        self.assertEqual(duplicate.stdout, "")
+        info = json.loads(self.trial().stdout)
+        self.assertEqual(info["status"], "trial")
+        self.assertEqual(info["trial_days"], 14)
+
+    def test_trial_query_unknown_subscription_exits_4(self) -> None:
+        result = self.trial("ghost", "basic")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_activate_on_or_after_conversion_date(self) -> None:
+        self.assertEqual(self.create("--trial-days", "14").returncode, 0)
+
+        too_early = self.activate("--as-of", "2026-01-14")
+        self.assertEqual(too_early.returncode, 2)
+        self.assertIn("trial_to_active_date", too_early.stderr)
+        self.assertEqual(too_early.stdout, "")
+        # Rejected activation must not change the stored status.
+        self.assertEqual(json.loads(self.trial().stdout)["status"], "trial")
+
+        activated = self.activate("--as-of", "2026-01-15")
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        self.assertEqual(
+            json.loads(activated.stdout),
+            {"customer_id": "c1", "plan": "basic", "status": "active",
+             "activated_on": "2026-01-15"},
+        )
+        self.assertEqual(len(activated.stdout.splitlines()), 1)
+
+        # The conversion persists and reads back through the trial query.
+        info = json.loads(self.trial().stdout)
+        self.assertEqual(info["status"], "active")
+        self.assertEqual(info["trial_to_active_date"], "2026-01-15")
+
+        # Activating again later keeps the subscription active and echoes the date.
+        later = self.activate("--as-of", "2026-02-01")
+        self.assertEqual(later.returncode, 0, later.stderr)
+        self.assertEqual(json.loads(later.stdout)["activated_on"], "2026-02-01")
+
+    def test_activate_validates_date_and_unknown_subscription(self) -> None:
+        self.assertEqual(self.create("--trial-days", "14").returncode, 0)
+
+        bad_date = self.activate("--as-of", "not-a-date")
+        self.assertEqual(bad_date.returncode, 2)
+        self.assertEqual(bad_date.stdout, "")
+
+        unknown = self.activate("--as-of", "2026-01-15", customer_id="ghost")
+        self.assertEqual(unknown.returncode, 4)
+        self.assertEqual(unknown.stdout, "")
+
+    def test_activate_no_trial_subscription(self) -> None:
+        self.assertEqual(self.create("--trial-days", "0").returncode, 0)
+        result = self.activate("--as-of", "2026-01-01")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"customer_id": "c1", "plan": "basic", "status": "active",
+             "activated_on": "2026-01-01"},
+        )
+        before_start = self.activate("--as-of", "2025-12-31")
+        self.assertEqual(before_start.returncode, 2)
+        self.assertEqual(before_start.stdout, "")
 
 
 if __name__ == "__main__":
