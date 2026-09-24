@@ -88,5 +88,31 @@ python3 -m billing_ledger usage reconcile --customer-id c1 --plan basic \
 - 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
   找不到匹配的订阅组合：stderr、退出码 4。
 
+## 订阅账单生成
+
+```bash
+# 按 [start-date, end-date] 闭区间为指定订阅生成一张账单，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger invoice generate --customer-id c1 --plan basic \
+  --start-date 2026-02-01 --end-date 2026-02-28
+# {"subscription_id":1,"period_start":"2026-02-01","period_end":"2026-02-28",
+#  "days":[{"usage_date":"2026-02-01","quantity":0,"billable":false,"amount_cents":0},...],
+#  "subtotal_cents":15840,"trial_days_used":7}
+```
+
+- 周期内每天按该订阅的 `price_cents`（每天每单位的分）乘以当日合计用量计价；
+  无用量日期 `quantity` 与 `amount_cents` 均为 0。同订阅同日期的多条用量求和。
+- 订阅 `start_date` 起连续 `trial_days` 天（含起始日）为试用期：落在试用期内的日期
+  `billable` 为 `false`、`amount_cents` 为 0（用量仍计入 `quantity` 明细），其余日期
+  `billable` 为 `true`。`trial_days_used` 为周期内落在试用期的天数，
+  `subtotal_cents` 为所有计费日 `amount_cents` 之和。
+- `days` 按日期升序覆盖周期内每一个日期；账单字段顺序固定为
+  `subscription_id`、`period_start`、`period_end`、`days`、`subtotal_cents`、`trial_days_used`。
+- 账单持久化到同一数据库的 `invoices` 表；同一订阅同一周期
+  （`subscription_id`+`period_start`+`period_end`）唯一。重复生成时 stderr 提示重复、
+  退出码 3，不覆盖、不新增记录，既有账单原样保留并可读回；同一订阅的其他周期仍可生成。
+- 生成过程只读取用量记录，不修改、不删除任何用量数据。
+- 日期须为合法 `YYYY-MM-DD` 且不晚于今天 UTC，且 `start_date` 不得晚于 `end_date`：
+  否则 stderr、退出码 2，不写入任何数据；找不到匹配的订阅组合：stderr、退出码 4，不写入。
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
-尚未实现账单生成以及收款核对与差异归集。
+尚未实现收款核对与差异归集。

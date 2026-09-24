@@ -389,5 +389,239 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.db_path.read_bytes(), before)
 
 
+class InvoiceTests(unittest.TestCase):
+    """End-to-end checks for subscription invoice generation."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create_subscription(
+        self,
+        customer_id: str = "c1",
+        plan: str = "basic",
+        price_cents: int = 100,
+        start_date: str = "2026-02-01",
+        trial_days: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", str(price_cents),
+            "--start-date", start_date,
+            "--trial-days", str(trial_days),
+        )
+
+    def record(self, usage_date: str, quantity: int) -> None:
+        result = self.invoke(
+            "usage", "record", "--customer-id", "c1", "--plan", "basic",
+            "--usage-date", usage_date, "--quantity", str(quantity),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def generate(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "invoice", "generate", "--customer-id", "c1", "--plan", "basic", *extra
+        )
+
+    def _invoice_rows(self) -> int:
+        import sqlite3
+
+        if not self.db_path.exists():
+            return 0
+        with sqlite3.connect(self.db_path) as connection:
+            exists = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='invoices'"
+            ).fetchall()
+            if not exists:
+                return 0
+            return int(connection.execute("SELECT COUNT(*) FROM invoices").fetchone()[0])
+
+    def test_invoice_prices_usage_and_excludes_trial_days(self) -> None:
+        self.assertEqual(
+            self.create_subscription(price_cents=100, start_date="2026-02-01", trial_days=7).returncode,
+            0,
+        )
+        # Feb 5 falls inside the trial window (Feb 1..Feb 7); Feb 8 and Feb 10 do not.
+        self.record("2026-02-05", 3)
+        self.record("2026-02-08", 2)
+        self.record("2026-02-10", 4)
+
+        result = self.generate("--start-date", "2026-02-01", "--end-date", "2026-02-10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        detail = json.loads(result.stdout)
+        self.assertEqual(
+            list(detail.keys()),
+            [
+                "subscription_id",
+                "period_start",
+                "period_end",
+                "days",
+                "subtotal_cents",
+                "trial_days_used",
+            ],
+        )
+        self.assertEqual(
+            detail,
+            {
+                "subscription_id": 1,
+                "period_start": "2026-02-01",
+                "period_end": "2026-02-10",
+                "days": [
+                    {"usage_date": "2026-02-01", "quantity": 0, "billable": False, "amount_cents": 0},
+                    {"usage_date": "2026-02-02", "quantity": 0, "billable": False, "amount_cents": 0},
+                    {"usage_date": "2026-02-03", "quantity": 0, "billable": False, "amount_cents": 0},
+                    {"usage_date": "2026-02-04", "quantity": 0, "billable": False, "amount_cents": 0},
+                    {"usage_date": "2026-02-05", "quantity": 3, "billable": False, "amount_cents": 0},
+                    {"usage_date": "2026-02-06", "quantity": 0, "billable": False, "amount_cents": 0},
+                    {"usage_date": "2026-02-07", "quantity": 0, "billable": False, "amount_cents": 0},
+                    {"usage_date": "2026-02-08", "quantity": 2, "billable": True, "amount_cents": 200},
+                    {"usage_date": "2026-02-09", "quantity": 0, "billable": True, "amount_cents": 0},
+                    {"usage_date": "2026-02-10", "quantity": 4, "billable": True, "amount_cents": 400},
+                ],
+                "subtotal_cents": 600,
+                "trial_days_used": 7,
+            },
+        )
+        for day in detail["days"]:
+            self.assertEqual(
+                list(day.keys()), ["usage_date", "quantity", "billable", "amount_cents"]
+            )
+
+    def test_trial_window_partially_overlaps_period(self) -> None:
+        # Trial Jan 30..Feb 1; the period starts Feb 1, so only one day is covered.
+        self.assertEqual(
+            self.create_subscription(price_cents=50, start_date="2026-01-30", trial_days=3).returncode,
+            0,
+        )
+        self.record("2026-02-01", 4)
+        self.record("2026-02-02", 4)
+
+        result = self.generate(
+            "--start-date", "2026-02-01", "--end-date", "2026-02-03"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detail = json.loads(result.stdout)
+        self.assertEqual(
+            [(d["usage_date"], d["billable"], d["amount_cents"]) for d in detail["days"]],
+            [
+                ("2026-02-01", False, 0),
+                ("2026-02-02", True, 200),
+                ("2026-02-03", True, 0),
+            ],
+        )
+        self.assertEqual(detail["subtotal_cents"], 200)
+        self.assertEqual(detail["trial_days_used"], 1)
+
+    def test_invoice_without_trial_bills_every_day(self) -> None:
+        self.assertEqual(self.create_subscription(price_cents=10).returncode, 0)
+        self.record("2026-02-15", 3)
+
+        result = self.generate("--start-date", "2026-02-15", "--end-date", "2026-02-15")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detail = json.loads(result.stdout)
+        self.assertEqual(
+            detail["days"],
+            [{"usage_date": "2026-02-15", "quantity": 3, "billable": True, "amount_cents": 30}],
+        )
+        self.assertEqual(detail["subtotal_cents"], 30)
+        self.assertEqual(detail["trial_days_used"], 0)
+
+    def test_duplicate_invoice_is_rejected_and_kept_readable(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        self.record("2026-02-10", 5)
+
+        first = self.generate("--start-date", "2026-02-01", "--end-date", "2026-02-28")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_detail = first.stdout
+
+        duplicate = self.generate("--start-date", "2026-02-01", "--end-date", "2026-02-28")
+        self.assertEqual(duplicate.returncode, 3)
+        self.assertIn("duplicate", duplicate.stderr)
+        self.assertEqual(duplicate.stdout, "")
+        self.assertEqual(self._invoice_rows(), 1)
+
+        import sqlite3
+
+        with sqlite3.connect(self.db_path) as connection:
+            stored = connection.execute("SELECT detail FROM invoices").fetchone()[0]
+        self.assertEqual(stored, first_detail.strip())
+
+        # A different cycle for the same subscription is still allowed.
+        other = self.generate("--start-date", "2026-03-01", "--end-date", "2026-03-02")
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertEqual(self._invoice_rows(), 2)
+
+    def test_invoice_validates_dates(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+
+        bad_start = self.generate("--start-date", "2026-02-30", "--end-date", "2026-03-01")
+        self.assertEqual(bad_start.returncode, 2)
+        self.assertEqual(bad_start.stdout, "")
+
+        bad_end = self.generate("--start-date", "2026-02-01", "--end-date", "not-a-date")
+        self.assertEqual(bad_end.returncode, 2)
+        self.assertEqual(bad_end.stdout, "")
+
+        inverted = self.generate("--start-date", "2026-02-10", "--end-date", "2026-02-01")
+        self.assertEqual(inverted.returncode, 2)
+        self.assertEqual(inverted.stdout, "")
+
+        future = self.generate("--start-date", "2026-02-01", "--end-date", "2099-01-01")
+        self.assertEqual(future.returncode, 2)
+        self.assertIn("today (UTC)", future.stderr)
+        self.assertEqual(future.stdout, "")
+
+        self.assertEqual(self._invoice_rows(), 0)
+
+    def test_invoice_unknown_subscription_exits_4(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        result = self.invoke(
+            "invoice", "generate", "--customer-id", "ghost", "--plan", "basic",
+            "--start-date", "2026-02-01", "--end-date", "2026-02-28",
+        )
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self._invoice_rows(), 0)
+
+    def test_generation_persists_invoice_without_touching_usage(self) -> None:
+        self.assertEqual(self.create_subscription(price_cents=100, trial_days=2).returncode, 0)
+        self.record("2026-02-01", 3)
+        self.record("2026-02-03", 2)
+
+        result = self.generate("--start-date", "2026-02-01", "--end-date", "2026-02-03")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        import sqlite3
+
+        with sqlite3.connect(self.db_path) as connection:
+            usage_rows = connection.execute(
+                "SELECT usage_date, quantity FROM usage_records ORDER BY id"
+            ).fetchall()
+            invoice_rows = connection.execute(
+                "SELECT subscription_id, period_start, period_end, subtotal_cents,"
+                " trial_days_used FROM invoices"
+            ).fetchall()
+        self.assertEqual(usage_rows, [("2026-02-01", 3), ("2026-02-03", 2)])
+        self.assertEqual(invoice_rows, [(1, "2026-02-01", "2026-02-03", 200, 2)])
+
+
 if __name__ == "__main__":
     unittest.main()
