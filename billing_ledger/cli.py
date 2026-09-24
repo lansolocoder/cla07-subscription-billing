@@ -75,6 +75,12 @@ def _build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
     reconcile.add_argument("--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
 
+    cycles = usage_subparsers.add_parser("cycles", help="查询区间内每日的计费周期归属与应计金额.")
+    cycles.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    cycles.add_argument("--plan", required=True, help="订阅计划，非空.")
+    cycles.add_argument("--start-date", required=True, help="查询起始日期（含），YYYY-MM-DD.")
+    cycles.add_argument("--end-date", required=True, help="查询结束日期（含），YYYY-MM-DD.")
+
     return parser
 
 
@@ -137,6 +143,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.usage_command == "reconcile":
             return usage.reconcile(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+        if args.usage_command == "cycles":
+            return usage.cycles(
                 customer_id=args.customer_id,
                 plan=args.plan,
                 start_date=args.start_date,

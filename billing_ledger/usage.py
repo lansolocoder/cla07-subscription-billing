@@ -50,6 +50,19 @@ def _find_subscription(
     return int(row[0]), str(row[1])
 
 
+def _find_subscription_detail(
+    connection: sqlite3.Connection, customer_id: str, plan: str
+) -> tuple[int, str, int, int] | None:
+    row = connection.execute(
+        "SELECT id, start_date, price_cents, trial_days FROM subscriptions"
+        " WHERE customer_id = ? AND plan = ?",
+        (customer_id, plan),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), str(row[1]), int(row[2]), int(row[3])
+
+
 def _parse_date(raw: str) -> date | None:
     return _parse_start_date(raw)
 
@@ -290,6 +303,89 @@ def reconcile(customer_id: str, plan: str, start_date: str, end_date: str) -> in
         "days": days,
         "cycle_total": cycle_total,
         "coverage": {"present_days": present_days, "missing_days": len(days) - present_days},
+    }
+    print(json.dumps(detail, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cycles(customer_id: str, plan: str, start_date: str, end_date: str) -> int:
+    """Attribute every day in ``[start_date, end_date]`` to a billing cycle.
+
+    Read-only. ``billing_start`` is the subscription ``start_date`` shifted by
+    ``trial_days``; days before ``start_date`` are reported with ``cycle_no``
+    0 and no charge, trial days are flagged with no charge, and every billing
+    day accrues ``price_cents`` against its 30-day cycle.
+    """
+    if not customer_id:
+        return _fail("--customer-id must not be empty")
+    if not plan:
+        return _fail("--plan must not be empty")
+
+    parsed_start = _parse_date(start_date)
+    if parsed_start is None:
+        return _fail(f"--start-date is not a valid YYYY-MM-DD date: {start_date}")
+    parsed_end = _parse_date(end_date)
+    if parsed_end is None:
+        return _fail(f"--end-date is not a valid YYYY-MM-DD date: {end_date}")
+    if parsed_start > parsed_end:
+        return _fail(
+            f"--start-date must not be later than --end-date: {start_date} > {end_date}"
+        )
+
+    connection = _connect()
+    try:
+        found = _find_subscription_detail(connection, customer_id, plan)
+        if found is None:
+            print(
+                f"billing-ledger: no subscription found for customer_id={customer_id} plan={plan}",
+                file=sys.stderr,
+            )
+            return 4
+        subscription_id, raw_sub_start, price_cents, trial_days = found
+    finally:
+        connection.close()
+
+    sub_start = _parse_date(raw_sub_start)
+    billing_start = sub_start + timedelta(days=trial_days)
+    trial_start = raw_sub_start if trial_days > 0 else None
+    trial_end = (billing_start - timedelta(days=1)).isoformat() if trial_days > 0 else None
+
+    days: list[dict[str, object]] = []
+    cycle_total_cents = 0
+    current = parsed_start
+    while current <= parsed_end:
+        usage_date = current.isoformat()
+        if current < sub_start:
+            cycle_no = 0
+            is_trial = False
+            amount_cents = 0
+        elif current < billing_start:
+            cycle_no = 0
+            is_trial = True
+            amount_cents = 0
+        else:
+            cycle_no = (current - billing_start).days // 30 + 1
+            is_trial = False
+            amount_cents = price_cents
+        cycle_total_cents += amount_cents
+        days.append(
+            {
+                "usage_date": usage_date,
+                "cycle_no": cycle_no,
+                "is_trial": is_trial,
+                "amount_cents": amount_cents,
+            }
+        )
+        current += timedelta(days=1)
+
+    detail = {
+        "subscription_id": subscription_id,
+        "period_start": start_date,
+        "period_end": end_date,
+        "trial_start": trial_start,
+        "trial_end": trial_end,
+        "days": days,
+        "cycle_total_cents": cycle_total_cents,
     }
     print(json.dumps(detail, ensure_ascii=False, separators=(",", ":")))
     return 0
