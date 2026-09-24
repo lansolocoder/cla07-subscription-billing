@@ -1,10 +1,11 @@
 """Command-line entry point."""
 
 import argparse
+import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import subscriptions
+from . import subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -39,7 +40,58 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subscription_subparsers.add_parser("list", help="列出全部订阅.")
 
+    usage_parser = subparsers.add_parser("usage", help="登记与查询用量.")
+    usage_subparsers = usage_parser.add_subparsers(dest="usage_command")
+
+    record = usage_subparsers.add_parser("record", help="录入一条或多条用量记录.")
+    record.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    record.add_argument("--plan", required=True, help="订阅计划，非空.")
+    record.add_argument(
+        "--usage-date",
+        required=True,
+        action="append",
+        help="用量发生日期，YYYY-MM-DD；可与 --quantity 成对重复指定多条.",
+    )
+    record.add_argument(
+        "--quantity",
+        required=True,
+        action="append",
+        help="用量数值，非负整数；可与 --usage-date 成对重复指定多条.",
+    )
+
+    usage_list = usage_subparsers.add_parser("list", help="按 id 升序列出某订阅的逐条用量.")
+    usage_list.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    usage_list.add_argument("--plan", required=True, help="订阅计划，非空.")
+
+    summary = usage_subparsers.add_parser("summary", help="按日汇总某订阅的用量.")
+    summary.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    summary.add_argument("--plan", required=True, help="订阅计划，非空.")
+    summary.add_argument("--start-date", help="开始日期（含），YYYY-MM-DD，缺省覆盖全部历史.")
+    summary.add_argument("--end-date", help="结束日期（含），YYYY-MM-DD，缺省覆盖全部历史.")
+
     return parser
+
+
+def _parse_entries(raw_dates: list[str], raw_quantities: list[str]) -> list[tuple[str, int]] | None:
+    if len(raw_dates) != len(raw_quantities):
+        print(
+            "billing-ledger: error: --usage-date and --quantity must be given the same"
+            f" number of times ({len(raw_dates)} dates vs {len(raw_quantities)} quantities)",
+            file=sys.stderr,
+        )
+        return None
+    entries: list[tuple[str, int]] = []
+    for usage_date, raw_quantity in zip(raw_dates, raw_quantities, strict=True):
+        try:
+            quantity = int(raw_quantity)
+        except ValueError:
+            print(f"billing-ledger: error: invalid non-negative integer: {raw_quantity!r}", file=sys.stderr)
+            return None
+        if quantity < 0:
+            print(f"billing-ledger: error: must be a non-negative integer: {raw_quantity!r}", file=sys.stderr)
+            return None
+        entries.append((usage_date, quantity))
+    return entries
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -57,6 +109,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.subscription_command == "list":
             return subscriptions.list_all()
+
+    if args.command == "usage":
+        if args.usage_command == "record":
+            entries = _parse_entries(args.usage_date, args.quantity)
+            if entries is None:
+                return 2
+            return usage.record(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                entries=entries,
+            )
+        if args.usage_command == "list":
+            return usage.list_records(customer_id=args.customer_id, plan=args.plan)
+        if args.usage_command == "summary":
+            return usage.summary(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
 
     parser.print_help()
     return 0

@@ -10,4 +10,63 @@ python3 -m billing_ledger --version
 python3 -m unittest discover -s tests -v
 ```
 
-当前仅提供帮助与版本查询入口；无参数显示帮助，未知参数以非零状态退出。尚未实现订阅登记、用量汇总、账单生成以及收款核对与差异归集，不会创建业务数据文件。
+数据持久化在仓库根目录的 `ledger.db`（SQLite，已在 `.gitignore` 中忽略）；
+设置环境变量 `BILLING_LEDGER_DB` 可改用其他数据库文件路径。
+
+## 订阅登记与查询
+
+```bash
+# 登记一条订阅（start_date 须为合法 YYYY-MM-DD 且不晚于今天 UTC）
+python3 -m billing_ledger subscription create \
+  --customer-id c1 --plan basic --price-cents 990 --start-date 2026-01-01
+
+# 列出全部订阅（单行 JSON 数组）
+python3 -m billing_ledger subscription list
+```
+
+## 用量录入
+
+```bash
+# 录入一条用量：成功时 stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger usage record \
+  --customer-id c1 --plan basic --usage-date 2026-01-10 --quantity 5
+# {"id":1,"customer_id":"c1","plan":"basic","usage_date":"2026-01-10","quantity":5}
+```
+
+- 用量记录与订阅同库持久化；记录号在同一数据库中全局唯一、单调分配、跨进程稳定。
+- 日期规则与订阅登记一致（合法 `YYYY-MM-DD`，不晚于今天 UTC），且不得早于该订阅的
+  `start_date`：非法日期或早于开始日期写 stderr、退出码 2，不写入数据。
+- 找不到匹配的 `customer_id` 与 `plan` 订阅组合：stderr、退出码 4，不写入数据。
+- 同一订阅同一日期允许跨提交重复录入多条（汇总时求和）。
+- 一次提交可重复成对指定 `--usage-date` 与 `--quantity` 录入多条；若同一次提交中出现
+  同订阅同日期的多条记录，则整批原子拒绝：stderr 提示重复、退出码 3，不写入任何一条。
+
+```bash
+# 一次提交多条（每条成功记录输出一行 JSON）
+python3 -m billing_ledger usage record --customer-id c1 --plan basic \
+  --usage-date 2026-01-11 --quantity 2 \
+  --usage-date 2026-01-12 --quantity 4
+```
+
+## 逐条用量查询
+
+```bash
+# 按 id 升序输出单行 JSON 数组；订阅不存在时 stderr、退出码 4
+python3 -m billing_ledger usage list --customer-id c1 --plan basic
+# [{"id":1,"usage_date":"2026-01-10","quantity":5},...]
+```
+
+## 按日汇总
+
+```bash
+# 覆盖全部历史用量，按 usage_date 升序，仅列出有用量记录的日期
+python3 -m billing_ledger usage summary --customer-id c1 --plan basic
+# [{"usage_date":"2026-01-10","total":8},...]
+
+# 可选闭区间范围（含端点）；日期非法或开始晚于结束时 stderr、退出码 2
+python3 -m billing_ledger usage summary --customer-id c1 --plan basic \
+  --start-date 2026-01-10 --end-date 2026-01-31
+```
+
+所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
+尚未实现账单生成以及收款核对与差异归集。
