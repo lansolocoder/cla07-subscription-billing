@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[1] / "ledger.db"
+DB_PATH = Path(
+    os.environ.get("BILLING_LEDGER_DB", str(Path(__file__).resolve().parents[1] / "ledger.db"))
+)
 
 _DATE_FORMAT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
