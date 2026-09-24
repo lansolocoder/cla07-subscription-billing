@@ -389,5 +389,136 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.db_path.read_bytes(), before)
 
 
+class CycleAttributionTests(unittest.TestCase):
+    """End-to-end checks for the billing-cycle attribution query."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create_subscription(
+        self,
+        customer_id: str = "c1",
+        plan: str = "basic",
+        start_date: str = "2026-01-01",
+        price_cents: str = "990",
+        trial_days: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", price_cents,
+            "--start-date", start_date,
+        ]
+        if trial_days is not None:
+            arguments.extend(["--trial-days", trial_days])
+        return self.invoke(*arguments)
+
+    def cycles(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke("usage", "cycles", "--customer-id", "c1", "--plan", "basic", *extra)
+
+    def test_cycles_without_trial(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+
+        result = self.cycles("--start-date", "2025-12-31", "--end-date", "2026-03-02")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        detail = json.loads(result.stdout)
+        self.assertEqual(detail["subscription_id"], 1)
+        self.assertEqual(detail["period_start"], "2025-12-31")
+        self.assertEqual(detail["period_end"], "2026-03-02")
+        self.assertIsNone(detail["trial_start"])
+        self.assertIsNone(detail["trial_end"])
+
+        days = detail["days"]
+        self.assertEqual(days[0], {"usage_date": "2025-12-31", "cycle_no": 0,
+                                   "is_trial": False, "amount_cents": 0})
+        # Cycle 1 covers 2026-01-01 .. 2026-01-30 (30 days).
+        self.assertTrue(all(d["cycle_no"] == 1 and d["amount_cents"] == 990
+                            and d["is_trial"] is False
+                            for d in days if "2026-01-01" <= d["usage_date"] <= "2026-01-30"))
+        # Cycle 2 covers 2026-01-31 .. 2026-03-01.
+        self.assertTrue(all(d["cycle_no"] == 2 and d["amount_cents"] == 990
+                            for d in days if "2026-01-31" <= d["usage_date"] <= "2026-03-01"))
+        self.assertEqual(days[-1], {"usage_date": "2026-03-02", "cycle_no": 3,
+                                    "is_trial": False, "amount_cents": 990})
+        # 61 billable days (Jan 1 .. Mar 2) at 990 cents each.
+        self.assertEqual(detail["cycle_total_cents"], 61 * 990)
+        self.assertEqual(len(days), 62)
+
+    def test_cycles_with_trial_window(self) -> None:
+        self.assertEqual(self.create_subscription(trial_days="7").returncode, 0)
+
+        result = self.cycles("--start-date", "2025-12-31", "--end-date", "2026-02-07")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detail = json.loads(result.stdout)
+        self.assertEqual(detail["trial_start"], "2026-01-01")
+        self.assertEqual(detail["trial_end"], "2026-01-07")
+
+        days = detail["days"]
+        self.assertEqual(days[0], {"usage_date": "2025-12-31", "cycle_no": 0,
+                                   "is_trial": False, "amount_cents": 0})
+        trial_days = [d for d in days if "2026-01-01" <= d["usage_date"] <= "2026-01-07"]
+        self.assertEqual(len(trial_days), 7)
+        self.assertTrue(all(d["cycle_no"] == 0 and d["is_trial"] and d["amount_cents"] == 0
+                            for d in trial_days))
+        # First billed cycle: 2026-01-08 .. 2026-02-06; 2026-02-07 starts cycle 2.
+        first_cycle = [d for d in days if "2026-01-08" <= d["usage_date"] <= "2026-02-06"]
+        self.assertEqual(len(first_cycle), 30)
+        self.assertTrue(all(d["cycle_no"] == 1 and d["amount_cents"] == 990
+                            and not d["is_trial"] for d in first_cycle))
+        self.assertEqual(days[-1], {"usage_date": "2026-02-07", "cycle_no": 2,
+                                    "is_trial": False, "amount_cents": 990})
+        # 31 billable days (30 in cycle 1 plus the first day of cycle 2).
+        self.assertEqual(detail["cycle_total_cents"], 31 * 990)
+
+    def test_cycles_validates_dates(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+
+        bad_start = self.cycles("--start-date", "2026-02-30", "--end-date", "2026-03-01")
+        self.assertEqual(bad_start.returncode, 2)
+        self.assertEqual(bad_start.stdout, "")
+
+        bad_end = self.cycles("--start-date", "2026-01-01", "--end-date", "not-a-date")
+        self.assertEqual(bad_end.returncode, 2)
+        self.assertEqual(bad_end.stdout, "")
+
+        inverted = self.cycles("--start-date", "2026-01-12", "--end-date", "2026-01-10")
+        self.assertEqual(inverted.returncode, 2)
+        self.assertEqual(inverted.stdout, "")
+
+    def test_cycles_unknown_subscription_exits_4(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        result = self.invoke(
+            "usage", "cycles", "--customer-id", "ghost", "--plan", "basic",
+            "--start-date", "2026-01-01", "--end-date", "2026-01-31",
+        )
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_cycles_does_not_write(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        before = self.db_path.read_bytes()
+        result = self.cycles("--start-date", "2025-12-01", "--end-date", "2026-03-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.db_path.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import subscriptions, usage
+from . import cycles, subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -75,6 +75,14 @@ def _build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
     reconcile.add_argument("--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
 
+    cycle_lookup = usage_subparsers.add_parser(
+        "cycles", help="查询区间内每日的计费周期归属、试用覆盖与应计金额."
+    )
+    cycle_lookup.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    cycle_lookup.add_argument("--plan", required=True, help="订阅计划，非空.")
+    cycle_lookup.add_argument("--start-date", required=True, help="区间起始日期（含），YYYY-MM-DD.")
+    cycle_lookup.add_argument("--end-date", required=True, help="区间结束日期（含），YYYY-MM-DD.")
+
     return parser
 
 
@@ -137,6 +145,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.usage_command == "reconcile":
             return usage.reconcile(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+        if args.usage_command == "cycles":
+            return cycles.attribution(
                 customer_id=args.customer_id,
                 plan=args.plan,
                 start_date=args.start_date,

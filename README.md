@@ -88,5 +88,29 @@ python3 -m billing_ledger usage reconcile --customer-id c1 --plan basic \
 - 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
   找不到匹配的订阅组合：stderr、退出码 4。
 
+## 计费周期归属查询
+
+```bash
+# 查询 [start-date, end-date] 闭区间内每日的周期归属，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger usage cycles --customer-id c1 --plan basic \
+  --start-date 2025-12-31 --end-date 2026-02-07
+# {"subscription_id":1,"period_start":"2025-12-31","period_end":"2026-02-07",
+#  "trial_start":"2026-01-01","trial_end":"2026-01-07",
+#  "days":[{"usage_date":"2025-12-31","cycle_no":0,"is_trial":false,"amount_cents":0},...],
+#  "cycle_total_cents":30690}
+```
+
+- `billing_start = start_date + trial_days`；试用期为 `[start_date, billing_start-1]`，
+  `trial_days` 为 0 时无试用（`trial_start`/`trial_end` 均为 `null`）。
+- 第 1 个计费周期为 `[billing_start, billing_start+29]`，之后每 30 天一个周期，
+  `cycle_no` 从 1 起连续递增。
+- 早于订阅 `start_date` 的日子照常出现：`cycle_no` 为 0、`amount_cents` 为 0；
+  试用日 `is_trial` 为 `true`、`amount_cents` 为 0；
+  计费日 `amount_cents` 等于订阅的 `price_cents`。
+- `cycle_total_cents` 为区间内全部日期 `amount_cents` 之和；`days` 按日升序覆盖区间每一天。
+- 该查询不产生任何持久化写入。
+- 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
+  找不到匹配的订阅组合：stderr、退出码 4。
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
 尚未实现账单生成以及收款核对与差异归集。
