@@ -257,5 +257,137 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertEqual(summary.stdout, "")
 
 
+class ReconcileTests(unittest.TestCase):
+    """End-to-end checks for the billing-cycle reconciliation detail."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create_subscription(
+        self, customer_id: str = "c1", plan: str = "basic", start_date: str = "2026-01-01"
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", "990",
+            "--start-date", start_date,
+        )
+
+    def record(self, usage_date: str, quantity: int) -> None:
+        result = self.invoke(
+            "usage", "record", "--customer-id", "c1", "--plan", "basic",
+            "--usage-date", usage_date, "--quantity", str(quantity),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def reconcile(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke("usage", "reconcile", "--customer-id", "c1", "--plan", "basic", *extra)
+
+    def test_reconcile_fills_every_day_and_marks_missing(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        self.record("2026-01-10", 5)
+        self.record("2026-01-10", 3)
+        self.record("2026-01-12", 0)
+
+        result = self.reconcile("--start-date", "2026-01-09", "--end-date", "2026-01-13")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "subscription_id": 1,
+                "period_start": "2026-01-09",
+                "period_end": "2026-01-13",
+                "days": [
+                    {"usage_date": "2026-01-09", "total": 0, "missing": True},
+                    {"usage_date": "2026-01-10", "total": 8, "missing": False},
+                    {"usage_date": "2026-01-11", "total": 0, "missing": True},
+                    {"usage_date": "2026-01-12", "total": 0, "missing": False},
+                    {"usage_date": "2026-01-13", "total": 0, "missing": True},
+                ],
+                "cycle_total": 8,
+                "coverage": {"present_days": 2, "missing_days": 3},
+            },
+        )
+
+    def test_reconcile_is_not_bound_by_subscription_start_date(self) -> None:
+        self.assertEqual(self.create_subscription(start_date="2026-01-05").returncode, 0)
+        self.record("2026-01-05", 2)
+
+        result = self.reconcile("--start-date", "2026-01-03", "--end-date", "2026-01-05")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detail = json.loads(result.stdout)
+        self.assertEqual(
+            detail["days"],
+            [
+                {"usage_date": "2026-01-03", "total": 0, "missing": True},
+                {"usage_date": "2026-01-04", "total": 0, "missing": True},
+                {"usage_date": "2026-01-05", "total": 2, "missing": False},
+            ],
+        )
+        self.assertEqual(detail["cycle_total"], 2)
+        self.assertEqual(detail["coverage"], {"present_days": 1, "missing_days": 2})
+
+    def test_reconcile_single_day_period(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        result = self.reconcile("--start-date", "2026-01-10", "--end-date", "2026-01-10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        detail = json.loads(result.stdout)
+        self.assertEqual(
+            detail["days"], [{"usage_date": "2026-01-10", "total": 0, "missing": True}]
+        )
+        self.assertEqual(detail["cycle_total"], 0)
+        self.assertEqual(detail["coverage"], {"present_days": 0, "missing_days": 1})
+
+    def test_reconcile_validates_dates(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+
+        bad_date = self.reconcile("--start-date", "2026-02-30", "--end-date", "2026-03-01")
+        self.assertEqual(bad_date.returncode, 2)
+        self.assertEqual(bad_date.stdout, "")
+
+        bad_end = self.reconcile("--start-date", "2026-01-01", "--end-date", "not-a-date")
+        self.assertEqual(bad_end.returncode, 2)
+        self.assertEqual(bad_end.stdout, "")
+
+        inverted = self.reconcile("--start-date", "2026-01-12", "--end-date", "2026-01-10")
+        self.assertEqual(inverted.returncode, 2)
+        self.assertEqual(inverted.stdout, "")
+
+    def test_reconcile_unknown_subscription_exits_4(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        result = self.invoke(
+            "usage", "reconcile", "--customer-id", "ghost", "--plan", "basic",
+            "--start-date", "2026-01-01", "--end-date", "2026-01-31",
+        )
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_reconcile_does_not_write(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        self.record("2026-01-10", 5)
+        before = self.db_path.read_bytes()
+        result = self.reconcile("--start-date", "2026-01-01", "--end-date", "2026-01-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.db_path.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()
