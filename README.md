@@ -146,7 +146,33 @@ python3 -m billing_ledger usage reconcile --customer-id c1 --plan basic \
 - 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
   找不到匹配的订阅组合：stderr、退出码 4。
 
+## 账单生成与查询
+
+```bash
+# 生成 [period-start, period-end] 闭区间的账单，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger bill generate --customer-id c1 --plan basic \
+  --period-start 2026-01-01 --period-end 2026-01-31
+# {"id":1,"customer_id":"c1","plan":"basic","period_start":"2026-01-01",
+#  "period_end":"2026-01-31","base_cents":990,"usage_cents":80,
+#  "total_cents":1070,"status":"open"}
+
+# 按 id 升序列出该订阅的全部账单（单行 JSON 数组；无账单时输出 []）
+python3 -m billing_ledger bill list --customer-id c1 --plan basic
+```
+
+- 仅状态为 `active` 的订阅允许生成账单；`trial` 订阅拒绝（stderr、退出码 2，不写入数据）。
+- 业务键为 `(customer_id, plan, period_start, period_end)`：重复生成同一周期为幂等读回，
+  不新建账单、不改变既有金额与状态，stdout 输出既有账单记录、退出码 0。
+- 基础费按周期内计费天数分摊：`floor(price_cents × 计费天数 ÷ 周期日数)`；
+  计费天数为周期内不早于 `max(start_date, trial_to_active_date)` 的日期数，
+  区间外与试用期内日期不计费；周期日数为周期日历天数。
+- 用量费为周期内用量总和（`cycle_total`）× 10 分；`total_cents` 为基础费与用量费之和，
+  无分摊或用量时可为 0。
+- 账单号在同一数据库中全局唯一、单调分配、跨进程稳定；生成后 `status` 为 `open`。
+- `--period-start` / `--period-end` 须为合法 `YYYY-MM-DD` 闭区间，起始晚于结束为参数错误
+  （stderr、退出码 2，不写入数据）；找不到匹配的订阅组合为 stderr、退出码 4。
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
 退出码约定：参数或日期非法为 2（不写入数据）；重复登记同一 `customer_id` 与 `plan`
 组合为 3（不覆盖已有订阅）；找不到匹配的订阅组合为 4；成功为 0。
-尚未实现账单生成以及收款核对与差异归集。
+尚未实现收款核对与差异归集。
