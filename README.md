@@ -172,7 +172,48 @@ python3 -m billing_ledger bill list --customer-id c1 --plan basic
 - `--period-start` / `--period-end` 须为合法 `YYYY-MM-DD` 闭区间，起始晚于结束为参数错误
   （stderr、退出码 2，不写入数据）；找不到匹配的订阅组合为 stderr、退出码 4。
 
-所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
+## 收款登记与结清核对
+
+```bash
+# 登记一笔收款：账单须存在且归属该 customer_id 与 plan；
+# 成功时 stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger payment record \
+  --customer-id c1 --plan basic --bill-id 1 \
+  --amount-cents 500 --payment-date 2026-02-05 --reference r1
+# {"id":1,"bill_id":1,"customer_id":"c1","plan":"basic","reference":"r1",
+#  "amount_cents":500,"payment_date":"2026-02-05","status":"applied"}
+
+# 按登记顺序逐笔核销账单 1：先输出每笔核销行，最后输出一行汇总
+python3 -m billing_ledger payment match --bill-id 1
+# {"bill_id":1,"reference":"r1","amount_cents":500,"applied_cents":500,"result":"underpaid"}
+# {"bill_id":1,"reference":"r2","amount_cents":700,"applied_cents":570,"result":"settled"}
+# {"bill_id":1,"reference":"r3","amount_cents":100,"applied_cents":0,"result":"overpaid"}
+# {"bill_id":1,"total_cents":1070,"paid_cents":1070,"status":"partial"}
+
+# 按 id 升序（登记顺序）列出全部收款（单行 JSON 数组；无收款时输出 []）
+python3 -m billing_ledger payment list
+```
+
+- 收款与账单同库持久化；收款号在同一数据库中全局唯一、单调分配、跨进程稳定。
+- `--amount-cents` 须为正整数；`--payment-date` 须为合法 `YYYY-MM-DD`；`--reference` 须非空。
+  参数或日期非法：stderr、退出码 2，不写入数据。
+- 账单不存在，或账单不属于给定的 `customer_id` 与 `plan`：stderr、退出码 4，不写入数据。
+  同一次提交同时存在参数/日期非法时，参数错误（退出码 2）优先于账单查找（退出码 4）。
+- `--reference` 全局唯一（跨账单、跨客户）：重复登记 stderr、退出码 5，不覆盖已有收款。
+- `payment match` 为只读、幂等：核销额每次都根据持久化的收款重新计算，重复执行输出完全相同、
+  核销不重复累计。
+- 逐笔核销规则（按登记顺序）：
+  - 累计核销额达到 `total_cents` 的一笔为最后一笔有效核销，`result` 为 `settled`，
+    超出部分只记到恰好结清（`applied_cents` 为本笔实际核销额，而非收款额）。
+  - 结清之后登记的各笔 `result` 为 `overpaid`、`applied_cents` 为 0。
+  - 已部分核销但累计仍不足的各笔 `result` 为 `underpaid`；最后一笔恰好相等为 `settled`。
+- 汇总行：`paid_cents` 为实际核销总额；恰好结清为 `paid`，累计不足为 `open`，
+  存在结清后的超收为 `partial`。账单无收款时仅输出汇总行（`paid_cents` 为 0、`status` 为 `open`）。
+- 账单不存在：stderr、退出码 4。
+
+所有成功与查询输出均写入 stdout 且为单行 JSON（`payment match` 为多行单行 JSON：
+每笔收款一行、汇总一行）；错误信息写入 stderr。
 退出码约定：参数或日期非法为 2（不写入数据）；重复登记同一 `customer_id` 与 `plan`
-组合为 3（不覆盖已有订阅）；找不到匹配的订阅组合为 4；成功为 0。
-尚未实现收款核对与差异归集。
+组合为 3（不覆盖已有订阅）；找不到匹配的订阅组合、账单或账单归属不符为 4；
+重复登记同一收款 `--reference` 为 5（不覆盖已有收款）；成功为 0。
+尚未实现差异归集。
