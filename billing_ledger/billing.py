@@ -132,7 +132,9 @@ def generate(customer_id: str, plan: str, period_start: str, period_end: str) ->
         quantity = _billable_quantity(
             connection, subscription_id, period_start, period_end, start_date, trial_days
         )
-        segments = -(-quantity // _BILLING_UNIT)
+        # 可计费用量为 0（如周期全在试用期内）时不计费；用量 > 0 才按每
+        # 100 单位向上取整 1 段。
+        segments = -(-quantity // _BILLING_UNIT) if quantity > 0 else 0
         amount_cents = segments * price_cents
 
         try:

@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import billing, subscriptions, usage
+from . import billing, payments, subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -15,6 +15,16 @@ def _non_negative_int(raw: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid non-negative integer: {raw!r}")
     if value < 0:
         raise argparse.ArgumentTypeError(f"must be a non-negative integer: {raw!r}")
+    return value
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {raw!r}")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer: {raw!r}")
     return value
 
 
@@ -87,6 +97,22 @@ def _build_parser() -> argparse.ArgumentParser:
     billing_list = billing_subparsers.add_parser("list", help="按 id 升序列出某订阅的全部账单.")
     billing_list.add_argument("--customer-id", required=True, help="客户标识，非空.")
     billing_list.add_argument("--plan", required=True, help="订阅计划，非空.")
+
+    payment = billing_subparsers.add_parser("payment", help="登记一笔收款并匹配到指定账单.")
+    payment.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    payment.add_argument("--plan", required=True, help="订阅计划，非空.")
+    payment.add_argument("--bill-id", required=True, type=int, help="账单 id，须属于该订阅.")
+    payment.add_argument(
+        "--amount-cents", required=True, type=_positive_int, help="收款金额，单位分，≥1 整数."
+    )
+    payment.add_argument("--payment-ref", required=True, help="收款流水号，非空，全库唯一.")
+
+    payment_status = billing_subparsers.add_parser(
+        "payment-status", help="读回指定账单的收款差异."
+    )
+    payment_status.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    payment_status.add_argument("--plan", required=True, help="订阅计划，非空.")
+    payment_status.add_argument("--bill-id", required=True, type=int, help="账单 id，须属于该订阅.")
 
     return parser
 
@@ -166,6 +192,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.billing_command == "list":
             return billing.list_bills(customer_id=args.customer_id, plan=args.plan)
+        if args.billing_command == "payment":
+            return payments.payment(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                bill_id=args.bill_id,
+                amount_cents=args.amount_cents,
+                payment_ref=args.payment_ref,
+            )
+        if args.billing_command == "payment-status":
+            return payments.payment_status(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                bill_id=args.bill_id,
+            )
 
     parser.print_help()
     return 0

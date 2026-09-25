@@ -555,5 +555,214 @@ class BillingTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
 
 
+class PaymentTests(unittest.TestCase):
+    """End-to-end checks for payment registration and balance reconciliation."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create_subscription(
+        self, customer_id: str = "c1", plan: str = "basic"
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", "990",
+            "--start-date", "2026-01-01",
+        )
+
+    def generate_bill(self, customer_id: str = "c1", plan: str = "basic") -> int:
+        result = self.invoke(
+            "billing", "generate",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--period-start", "2026-01-01",
+            "--period-end", "2026-01-31",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return int(json.loads(result.stdout)["id"])
+
+    def pay(self, bill_id: int, amount: int, ref: str, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "billing", "payment",
+            "--customer-id", "c1",
+            "--plan", "basic",
+            "--bill-id", str(bill_id),
+            "--amount-cents", str(amount),
+            "--payment-ref", ref,
+            *extra,
+        )
+
+    def status(self, bill_id: int, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "billing", "payment-status",
+            "--customer-id", "c1",
+            "--plan", "basic",
+            "--bill-id", str(bill_id),
+            *extra,
+        )
+
+    def test_payment_and_status_flow(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        bill_id = self.generate_bill()
+
+        unpaid = self.status(bill_id)
+        self.assertEqual(unpaid.returncode, 0, unpaid.stderr)
+        self.assertEqual(
+            json.loads(unpaid.stdout),
+            {"bill_id": bill_id, "amount_cents": 0, "paid_cents": 0,
+             "balance_cents": 0, "status": "paid"},
+        )
+
+        first = self.pay(bill_id, 990, "pay-001")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(first.stdout.splitlines()), 1)
+        self.assertEqual(
+            first.stdout.strip(),
+            '{"id":1,"bill_id":%d,"amount_cents":990,"payment_ref":"pay-001","status":"applied"}'
+            % bill_id,
+        )
+
+        # A bill accumulates multiple payments; ids are global and monotonic.
+        second = self.pay(bill_id, 10, "pay-002")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["id"], 2)
+
+        overpaid = self.status(bill_id)
+        self.assertEqual(
+            json.loads(overpaid.stdout),
+            {"bill_id": bill_id, "amount_cents": 0, "paid_cents": 1000,
+             "balance_cents": -1000, "status": "overpaid"},
+        )
+
+    def test_status_unpaid_and_paid(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        self.invoke(
+            "usage", "record", "--customer-id", "c1", "--plan", "basic",
+            "--usage-date", "2026-01-10", "--quantity", "50",
+        )
+        bill_id = self.generate_bill()
+
+        unpaid = self.status(bill_id)
+        self.assertEqual(
+            json.loads(unpaid.stdout),
+            {"bill_id": bill_id, "amount_cents": 990, "paid_cents": 0,
+             "balance_cents": 990, "status": "unpaid"},
+        )
+
+        self.assertEqual(self.pay(bill_id, 990, "pay-001").returncode, 0)
+        paid = self.status(bill_id)
+        self.assertEqual(
+            json.loads(paid.stdout),
+            {"bill_id": bill_id, "amount_cents": 990, "paid_cents": 990,
+             "balance_cents": 0, "status": "paid"},
+        )
+
+    def test_duplicate_payment_ref_exits_3_without_writing(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        bill_id = self.generate_bill()
+        self.assertEqual(self.pay(bill_id, 100, "pay-001").returncode, 0)
+
+        # Re-running the identical command is a duplicate too.
+        duplicate = self.pay(bill_id, 100, "pay-001")
+        self.assertEqual(duplicate.returncode, 3)
+        self.assertIn("duplicate", duplicate.stderr)
+        self.assertEqual(duplicate.stdout, "")
+
+        other_bill = self.invoke(
+            "billing", "generate", "--customer-id", "c1", "--plan", "basic",
+            "--period-start", "2026-02-01", "--period-end", "2026-02-28",
+        )
+        other_bill_id = int(json.loads(other_bill.stdout)["id"])
+        cross_bill = self.pay(other_bill_id, 100, "pay-001")
+        self.assertEqual(cross_bill.returncode, 3)
+
+        status = self.status(bill_id)
+        self.assertEqual(json.loads(status.stdout)["paid_cents"], 100)
+
+    def test_payment_validates_arguments(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        bill_id = self.generate_bill()
+
+        zero_amount = self.pay(bill_id, 0, "pay-001")
+        self.assertEqual(zero_amount.returncode, 2)
+        self.assertEqual(zero_amount.stdout, "")
+
+        negative_amount = self.pay(bill_id, -5, "pay-001")
+        self.assertEqual(negative_amount.returncode, 2)
+
+        empty_ref = self.pay(bill_id, 100, "")
+        self.assertEqual(empty_ref.returncode, 2)
+
+        bad_bill_id = self.invoke(
+            "billing", "payment", "--customer-id", "c1", "--plan", "basic",
+            "--bill-id", "not-a-number", "--amount-cents", "100", "--payment-ref", "pay-001",
+        )
+        self.assertEqual(bad_bill_id.returncode, 2)
+
+        status = self.status(bill_id)
+        self.assertEqual(json.loads(status.stdout)["paid_cents"], 0)
+
+    def test_payment_unknown_subscription_or_bill_exits_4(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        bill_id = self.generate_bill()
+
+        ghost_sub = self.invoke(
+            "billing", "payment", "--customer-id", "ghost", "--plan", "basic",
+            "--bill-id", str(bill_id), "--amount-cents", "100", "--payment-ref", "pay-001",
+        )
+        self.assertEqual(ghost_sub.returncode, 4)
+        self.assertEqual(ghost_sub.stdout, "")
+
+        ghost_bill = self.pay(bill_id + 100, 100, "pay-001")
+        self.assertEqual(ghost_bill.returncode, 4)
+
+        # A bill belonging to another subscription is not found either.
+        self.assertEqual(self.create_subscription("c2", "pro").returncode, 0)
+        other_bill_id = self.generate_bill("c2", "pro")
+        foreign_bill = self.pay(other_bill_id, 100, "pay-001")
+        self.assertEqual(foreign_bill.returncode, 4)
+
+        ghost_status = self.status(bill_id + 100)
+        self.assertEqual(ghost_status.returncode, 4)
+        self.assertEqual(ghost_status.stdout, "")
+
+    def test_zero_billable_quantity_generates_zero_amount(self) -> None:
+        # Entire period inside the trial window: no "round up to one segment".
+        result = self.invoke(
+            "subscription", "create", "--customer-id", "c1", "--plan", "basic",
+            "--price-cents", "990", "--start-date", "2026-01-01", "--trial-days", "31",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.invoke(
+            "usage", "record", "--customer-id", "c1", "--plan", "basic",
+            "--usage-date", "2026-01-10", "--quantity", "500",
+        )
+        bill = self.invoke(
+            "billing", "generate", "--customer-id", "c1", "--plan", "basic",
+            "--period-start", "2026-01-01", "--period-end", "2026-01-31",
+        )
+        self.assertEqual(bill.returncode, 0, bill.stderr)
+        record = json.loads(bill.stdout)
+        self.assertEqual(record["billable_quantity"], 0)
+        self.assertEqual(record["amount_cents"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
