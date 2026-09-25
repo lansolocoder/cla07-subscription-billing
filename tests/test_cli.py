@@ -580,5 +580,333 @@ class TrialManagementTests(unittest.TestCase):
         self.assertEqual(second["trial_to_active_date"], "2026-01-15")
 
 
+class SubscriptionModifyTests(unittest.TestCase):
+    """End-to-end checks for trial subscription modification."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+        from datetime import datetime, timezone
+
+        self.today = datetime.now(timezone.utc).date()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def iso(self, offset_days: int) -> str:
+        from datetime import timedelta
+
+        return (self.today + timedelta(days=offset_days)).isoformat()
+
+    def create_trial(
+        self,
+        customer_id: str = "c1",
+        plan: str = "basic",
+        start_date: str | None = None,
+        end_offset: int = 13,
+        price_cents: str = "990",
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", price_cents,
+            "--start-date", start_date or self.iso(0),
+            "--trial-end-date", self.iso(end_offset),
+        )
+
+    def modify(self, *extra: str, customer_id: str = "c1", plan: str = "basic"):
+        return self.invoke(
+            "subscription", "modify",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            *extra,
+        )
+
+    def test_modify_price_only_keeps_plan_and_trial_dates(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+        result = self.modify("--price-cents", "1290")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "customer_id": "c1",
+                "plan": "basic",
+                "trial_days": 14,
+                "trial_end_date": self.iso(13),
+                "trial_to_active_date": self.iso(14),
+                "status": "trial",
+            },
+        )
+
+        listed = self.invoke("subscription", "list")
+        rows = {r["plan"]: r for r in json.loads(listed.stdout)}
+        self.assertEqual(rows["basic"]["price_cents"], 1290)
+        self.assertEqual(rows["basic"]["status"], "trial")
+
+    def test_modify_trial_end_recomputes_days_and_conversion(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+        result = self.modify("--trial-end-date", self.iso(20))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "customer_id": "c1",
+                "plan": "basic",
+                "trial_days": 21,
+                "trial_end_date": self.iso(20),
+                "trial_to_active_date": self.iso(21),
+                "status": "trial",
+            },
+        )
+
+        view = json.loads(
+            self.invoke(
+                "subscription", "trial", "--customer-id", "c1", "--plan", "basic"
+            ).stdout
+        )
+        self.assertEqual(view["trial_end_date"], self.iso(20))
+        self.assertEqual(view["trial_to_active_date"], self.iso(21))
+        self.assertEqual(view["trial_days"], 21)
+        self.assertEqual(view["status"], "trial")
+
+    def test_trial_end_equal_to_old_end_is_allowed(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+        result = self.modify("--trial-end-date", self.iso(13))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["trial_end_date"], self.iso(13))
+
+    def test_rename_plan_relocates_and_keeps_usage(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+        record = self.invoke(
+            "usage", "record", "--customer-id", "c1", "--plan", "basic",
+            "--usage-date", self.iso(0), "--quantity", "5",
+        )
+        self.assertEqual(record.returncode, 0, record.stderr)
+
+        result = self.modify("--plan-new", "pro", "--price-cents", "1990")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "customer_id": "c1",
+                "plan": "pro",
+                "trial_days": 14,
+                "trial_end_date": self.iso(13),
+                "trial_to_active_date": self.iso(14),
+                "status": "trial",
+            },
+        )
+
+        old = self.invoke("subscription", "trial", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(old.returncode, 4)
+        self.assertEqual(old.stdout, "")
+
+        new = self.invoke("subscription", "trial", "--customer-id", "c1", "--plan", "pro")
+        self.assertEqual(new.returncode, 0, new.stderr)
+        self.assertEqual(json.loads(new.stdout)["status"], "trial")
+
+        usage_list = self.invoke("usage", "list", "--customer-id", "c1", "--plan", "pro")
+        self.assertEqual(
+            json.loads(usage_list.stdout),
+            [{"id": 1, "usage_date": self.iso(0), "quantity": 5}],
+        )
+        usage_old = self.invoke("usage", "list", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(usage_old.returncode, 4)
+
+        summary = self.invoke("usage", "summary", "--customer-id", "c1", "--plan", "pro")
+        self.assertEqual(
+            json.loads(summary.stdout),
+            [{"usage_date": self.iso(0), "total": 5}],
+        )
+
+    def test_batch_changes_apply_atomically(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+        result = self.modify(
+            "--plan-new", "pro",
+            "--price-cents", "1990",
+            "--trial-end-date", self.iso(27),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "customer_id": "c1",
+                "plan": "pro",
+                "trial_days": 28,
+                "trial_end_date": self.iso(27),
+                "trial_to_active_date": self.iso(28),
+                "status": "trial",
+            },
+        )
+
+    def test_no_change_argument_exits_2(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+        result = self.modify()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("at least one", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_plan_new_equal_to_current_exits_2(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+        same = self.modify("--plan-new", "basic")
+        self.assertEqual(same.returncode, 2)
+        self.assertEqual(same.stdout, "")
+
+        empty = self.modify("--plan-new", "")
+        self.assertEqual(empty.returncode, 2)
+        self.assertEqual(empty.stdout, "")
+
+    def test_invalid_price_and_date_exit_2_without_writing(self) -> None:
+        self.assertEqual(self.create_trial().returncode, 0)
+
+        bad_price = self.modify("--price-cents", "-5")
+        self.assertEqual(bad_price.returncode, 2)
+        self.assertEqual(bad_price.stdout, "")
+
+        bad_price_text = self.modify("--price-cents", "abc")
+        self.assertEqual(bad_price_text.returncode, 2)
+        self.assertEqual(bad_price_text.stdout, "")
+
+        bad_date = self.modify("--trial-end-date", "2026-02-30", "--price-cents", "1290")
+        self.assertEqual(bad_date.returncode, 2)
+        self.assertEqual(bad_date.stdout, "")
+
+        listed = self.invoke("subscription", "list")
+        row = json.loads(listed.stdout)[0]
+        self.assertEqual(row["plan"], "basic")
+        self.assertEqual(row["price_cents"], 990)
+
+    def test_new_end_before_today_exits_2(self) -> None:
+        # Start in the past so the date fails the today rule, not the start-date rule.
+        self.assertEqual(
+            self.create_trial(start_date="2025-12-01").returncode, 0
+        )
+        result = self.modify("--trial-end-date", self.iso(-1))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("today", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_new_end_before_old_end_exits_2(self) -> None:
+        self.assertEqual(self.create_trial(end_offset=20).returncode, 0)
+        result = self.modify("--trial-end-date", self.iso(10))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("current trial_end_date", result.stderr)
+        self.assertEqual(result.stdout, "")
+        view = json.loads(
+            self.invoke(
+                "subscription", "trial", "--customer-id", "c1", "--plan", "basic"
+            ).stdout
+        )
+        self.assertEqual(view["trial_end_date"], self.iso(20))
+
+    def test_active_subscription_cannot_be_modified(self) -> None:
+        create = self.invoke(
+            "subscription", "create",
+            "--customer-id", "c1", "--plan", "basic",
+            "--price-cents", "990", "--start-date", self.iso(0),
+        )
+        self.assertEqual(create.returncode, 0, create.stderr)
+
+        result = self.modify("--price-cents", "1290")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("trial", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        with_date = self.modify("--trial-end-date", self.iso(10))
+        self.assertEqual(with_date.returncode, 2)
+        self.assertEqual(with_date.stdout, "")
+
+    def test_modify_unknown_subscription_exits_4(self) -> None:
+        result = self.modify("--price-cents", "1290", customer_id="ghost")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_plan_rename_collision_exits_4_without_overwriting(self) -> None:
+        self.assertEqual(self.create_trial("c1", "basic", end_offset=10).returncode, 0)
+        self.assertEqual(self.create_trial("c1", "pro", price_cents="1990").returncode, 0)
+
+        result = self.modify("--plan-new", "pro")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        basic = self.invoke("subscription", "trial", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(basic.returncode, 0)
+        pro = self.invoke("subscription", "trial", "--customer-id", "c1", "--plan", "pro")
+        self.assertEqual(json.loads(pro.stdout)["trial_end_date"], self.iso(13))
+
+    def test_error_precedence_invalid_date_beats_active_and_not_found(self) -> None:
+        self.assertEqual(
+            self.invoke(
+                "subscription", "create",
+                "--customer-id", "c1", "--plan", "basic",
+                "--price-cents", "990", "--start-date", self.iso(0),
+            ).returncode,
+            0,
+        )
+        # An active subscription with an invalid date: invalid arguments win over status.
+        active_bad = self.modify("--trial-end-date", "not-a-date")
+        self.assertEqual(active_bad.returncode, 2)
+        self.assertEqual(active_bad.stdout, "")
+
+        # A missing subscription with an invalid date: invalid arguments win over not-found.
+        missing_bad = self.modify(
+            "--trial-end-date", "not-a-date", customer_id="ghost"
+        )
+        self.assertEqual(missing_bad.returncode, 2)
+        self.assertEqual(missing_bad.stdout, "")
+
+    def test_error_precedence_early_date_beats_collision(self) -> None:
+        self.assertEqual(self.create_trial("c1", "basic", end_offset=20).returncode, 0)
+        self.assertEqual(self.create_trial("c1", "pro").returncode, 0)
+        # The rename would collide (exit 4), but the earlier date (exit 2) wins.
+        result = self.modify(
+            "--plan-new", "pro", "--trial-end-date", self.iso(10)
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("current trial_end_date", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        basic = self.invoke("subscription", "trial", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(basic.returncode, 0)
+        self.assertEqual(json.loads(basic.stdout)["trial_end_date"], self.iso(20))
+
+    def test_failed_batch_changes_nothing(self) -> None:
+        self.assertEqual(self.create_trial("c1", "basic", end_offset=20).returncode, 0)
+        result = self.modify(
+            "--plan-new", "pro",
+            "--price-cents", "1990",
+            "--trial-end-date", self.iso(10),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+
+        view = json.loads(
+            self.invoke(
+                "subscription", "trial", "--customer-id", "c1", "--plan", "basic"
+            ).stdout
+        )
+        self.assertEqual(view["plan"], "basic")
+        self.assertEqual(view["trial_end_date"], self.iso(20))
+
+        listed = self.invoke("subscription", "list")
+        row = json.loads(listed.stdout)[0]
+        self.assertEqual(row["price_cents"], 990)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -299,3 +299,150 @@ def activate(customer_id: str, plan: str, as_of: str | None = None) -> int:
     }
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
+
+
+def modify(
+    customer_id: str,
+    plan: str,
+    plan_new: str | None = None,
+    price_cents: int | None = None,
+    trial_end_date: str | None = None,
+) -> int:
+    """Change the plan, price and/or trial end date of a trial subscription.
+
+    All supplied changes take effect atomically; only ``trial`` subscriptions
+    may be changed. Error precedence (first hit wins): invalid arguments or
+    dates, changing an ``active`` subscription, a new trial end date earlier
+    than the current one (all exit 2); then subscription not found or a plan
+    rename colliding with an existing (customer_id, plan) pair (exit 4).
+    """
+    if not customer_id:
+        return _fail("--customer-id must not be empty")
+    if not plan:
+        return _fail("--plan must not be empty")
+    if plan_new is None and price_cents is None and trial_end_date is None:
+        return _fail(
+            "at least one of --plan-new, --price-cents or --trial-end-date is required"
+        )
+    if plan_new is not None and not plan_new:
+        return _fail("--plan-new must not be empty")
+    if plan_new is not None and plan_new == plan:
+        return _fail("--plan-new must differ from the current plan")
+    if price_cents is not None and price_cents < 0:
+        return _fail("--price-cents must be a non-negative integer")
+
+    parsed_new_end: date | None = None
+    if trial_end_date is not None:
+        parsed_new_end = _parse_start_date(trial_end_date)
+        if parsed_new_end is None:
+            return _fail(
+                f"--trial-end-date is not a valid YYYY-MM-DD date: {trial_end_date}"
+            )
+
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT id, price_cents, start_date, status, trial_days,"
+            " trial_end_date, trial_to_active_date"
+            " FROM subscriptions WHERE customer_id = ? AND plan = ?",
+            (customer_id, plan),
+        ).fetchone()
+        if row is None:
+            print(
+                f"billing-ledger: no subscription found for customer_id={customer_id} plan={plan}",
+                file=sys.stderr,
+            )
+            return 4
+
+        subscription_id = int(row[0])
+        effective_price_cents = price_cents if price_cents is not None else int(row[1])
+        start_date = _parse_start_date(str(row[2]))
+        status = str(row[3])
+        effective_trial_days = int(row[4])
+        effective_trial_end = row[5]
+        effective_trial_to_active = row[6]
+        old_trial_end = _parse_start_date(str(row[5]))
+
+        if status != "trial":
+            return _fail(f"only trial subscriptions can be modified; status is {status}")
+
+        if parsed_new_end is not None:
+            if start_date is None:
+                return _fail(f"stored start_date is not a valid YYYY-MM-DD date: {row[2]}")
+            today = datetime.now(timezone.utc).date()
+            if parsed_new_end < start_date:
+                return _fail(
+                    "--trial-end-date must not be earlier than --start-date: "
+                    f"{trial_end_date} < {row[2]}"
+                )
+            if parsed_new_end < today:
+                return _fail(
+                    "--trial-end-date must not be earlier than today (UTC): "
+                    f"{trial_end_date}"
+                )
+            if old_trial_end is None:
+                return _fail("stored trial_end_date is missing for a trial subscription")
+            if parsed_new_end < old_trial_end:
+                return _fail(
+                    "--trial-end-date must not be earlier than the current trial_end_date: "
+                    f"{trial_end_date} < {old_trial_end.isoformat()}"
+                )
+            effective_trial_days = (parsed_new_end - start_date).days + 1
+            effective_trial_end = trial_end_date
+            effective_trial_to_active = (parsed_new_end + timedelta(days=1)).isoformat()
+
+        effective_plan = plan_new if plan_new is not None else plan
+        if plan_new is not None:
+            collision = connection.execute(
+                "SELECT 1 FROM subscriptions WHERE customer_id = ? AND plan = ? AND id <> ?",
+                (customer_id, plan_new, subscription_id),
+            ).fetchone()
+            if collision is not None:
+                print(
+                    "billing-ledger: a subscription already exists for"
+                    f" customer_id={customer_id} plan={plan_new}",
+                    file=sys.stderr,
+                )
+                return 4
+
+        try:
+            connection.execute(
+                "UPDATE subscriptions SET plan = ?, price_cents = ?, trial_days = ?,"
+                " trial_end_date = ?, trial_to_active_date = ? WHERE id = ?",
+                (
+                    effective_plan,
+                    effective_price_cents,
+                    effective_trial_days,
+                    effective_trial_end,
+                    effective_trial_to_active,
+                    subscription_id,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        updated = connection.execute(
+            "SELECT customer_id, plan, trial_days, trial_end_date,"
+            " trial_to_active_date, status FROM subscriptions WHERE id = ?",
+            (subscription_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    print(
+        json.dumps(
+            {
+                "customer_id": updated[0],
+                "plan": updated[1],
+                "trial_days": int(updated[2]),
+                "trial_end_date": updated[3],
+                "trial_to_active_date": updated[4],
+                "status": updated[5],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    return 0

@@ -58,6 +58,37 @@ python3 -m billing_ledger subscription activate \
 # {"customer_id":"c2","plan":"pro","status":"active","activated_on":"2026-01-15"}
 ```
 
+## 订阅变更（试用期内）
+
+试用期内可变更计划、价格或试用结束日期，按 `--customer-id` 与 `--plan` 定位唯一订阅；
+只有状态为 `trial` 的订阅允许变更，`active` 订阅变更报错（退出码 2）。
+
+```bash
+# 可变参数（一次至少指定一项）：
+#   --plan-new       改为另一计划名，非空，且须与当前 plan 不同
+#   --price-cents    新价格，非负整数
+#   --trial-end-date 新试用结束日期（含），合法 YYYY-MM-DD
+# 多项同时给出时整批原子生效：任一校验失败则全部不生效，订阅保持原样
+python3 -m billing_ledger subscription modify \
+  --customer-id c2 --plan pro --plan-new enterprise --price-cents 2990 \
+  --trial-end-date 2026-02-14
+# {"customer_id":"c2","plan":"enterprise","trial_days":45,
+#  "trial_end_date":"2026-02-14","trial_to_active_date":"2026-02-15","status":"trial"}
+```
+
+- 输出为 stdout 单行紧凑 JSON，字段为 `customer_id`、`plan`（变更后的计划名）、
+  `trial_days`、`trial_end_date`、`trial_to_active_date`、`status`（字面值 `trial`）。
+- `--plan-new` 改名后按新的 `(customer_id, plan_new)` 组合定位；若该组合已存在则整批
+  拒绝、不覆盖（stderr、退出码 4）。订阅 `id` 不变，原有逐条用量与按日汇总查询结果
+  保持不变，只是改用新组合查询。
+- 新试用结束日期不早于 `start_date`、不早于今天 UTC，也不早于旧试用结束日期；
+  `trial_days` 按 `[start_date, 新结束日期]` 的天数重新计算，
+  `trial_to_active_date` 为新结束日期加一天；变更后 `status` 仍为 `trial`，
+  `subscription trial` 查询读回新值。
+- 一次提交同时命中多类错误时，按优先级确定唯一报错：先参数或日期非法、对 `active`
+  订阅变更、新结束日期早于旧结束日期（均为 stderr、退出码 2）；均未命中才判找不到
+  订阅或改名后与已有订阅冲突（stderr、退出码 4）。所有错误均不写入数据。
+
 ## 用量录入
 
 ```bash

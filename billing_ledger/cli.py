@@ -63,6 +63,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="转正生效日期，YYYY-MM-DD，缺省为今天 UTC；早于转正日期时拒绝.",
     )
 
+    modify = subscription_subparsers.add_parser(
+        "modify", help="变更试用订阅的计划、价格或试用结束日期."
+    )
+    modify.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    modify.add_argument("--plan", required=True, help="当前订阅计划，非空.")
+    modify.add_argument("--plan-new", help="变更后的计划名，非空，且须与当前计划不同.")
+    modify.add_argument(
+        "--price-cents",
+        type=_non_negative_int,
+        default=None,
+        help="变更后的价格，单位分，非负整数.",
+    )
+    modify.add_argument(
+        "--trial-end-date",
+        default=None,
+        help="变更后的试用结束日期（含），YYYY-MM-DD；不得早于开始日期、今天 UTC 或旧结束日期.",
+    )
+
     usage_parser = subparsers.add_parser("usage", help="登记与查询用量.")
     usage_subparsers = usage_parser.add_subparsers(dest="usage_command")
 
@@ -146,6 +164,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 customer_id=args.customer_id,
                 plan=args.plan,
                 as_of=args.as_of,
+            )
+        if args.subscription_command == "modify":
+            return subscriptions.modify(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                plan_new=args.plan_new,
+                price_cents=args.price_cents,
+                trial_end_date=args.trial_end_date,
             )
 
     if args.command == "usage":
