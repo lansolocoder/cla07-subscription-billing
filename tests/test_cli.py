@@ -389,5 +389,171 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.db_path.read_bytes(), before)
 
 
+class BillingTests(unittest.TestCase):
+    """End-to-end checks for bill generation and listing."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create_subscription(
+        self,
+        customer_id: str = "c1",
+        plan: str = "basic",
+        start_date: str = "2026-01-01",
+        trial_days: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", "990",
+            "--start-date", start_date,
+            "--trial-days", str(trial_days),
+        )
+
+    def record(self, usage_date: str, quantity: int) -> None:
+        result = self.invoke(
+            "usage", "record", "--customer-id", "c1", "--plan", "basic",
+            "--usage-date", usage_date, "--quantity", str(quantity),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def generate(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        return self.invoke("billing", "generate", "--customer-id", "c1", "--plan", "basic", *extra)
+
+    def test_generate_rounds_up_per_hundred_units(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        self.record("2026-01-10", 150)
+        self.record("2026-01-10", 60)
+        self.record("2026-01-20", 1)
+
+        result = self.generate("--period-start", "2026-01-01", "--period-end", "2026-01-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "id": 1,
+                "subscription_id": 1,
+                "period_start": "2026-01-01",
+                "period_end": "2026-01-31",
+                "billable_quantity": 211,
+                "amount_cents": 3 * 990,
+                "status": "issued",
+            },
+        )
+
+    def test_generate_excludes_trial_window(self) -> None:
+        # Trial covers 2026-01-01..2026-01-10 (start_date is day 1).
+        self.assertEqual(
+            self.create_subscription(start_date="2026-01-01", trial_days=10).returncode, 0
+        )
+        self.record("2026-01-01", 500)
+        self.record("2026-01-10", 500)
+        self.record("2026-01-11", 50)
+
+        result = self.generate("--period-start", "2026-01-01", "--period-end", "2026-01-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bill = json.loads(result.stdout)
+        self.assertEqual(bill["billable_quantity"], 50)
+        self.assertEqual(bill["amount_cents"], 990)
+
+    def test_generate_allows_period_before_start_date(self) -> None:
+        self.assertEqual(self.create_subscription(start_date="2026-01-15").returncode, 0)
+        self.record("2026-01-15", 7)
+
+        result = self.generate("--period-start", "2026-01-01", "--period-end", "2026-01-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bill = json.loads(result.stdout)
+        self.assertEqual(bill["billable_quantity"], 7)
+        self.assertEqual(bill["amount_cents"], 990)
+
+        empty = self.generate("--period-start", "2025-12-01", "--period-end", "2025-12-31")
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        bill = json.loads(empty.stdout)
+        self.assertEqual(bill["billable_quantity"], 0)
+        self.assertEqual(bill["amount_cents"], 0)
+
+    def test_generate_duplicate_period_exits_3_without_writing(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        first = self.generate("--period-start", "2026-01-01", "--period-end", "2026-01-31")
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = self.generate("--period-start", "2026-01-01", "--period-end", "2026-01-31")
+        self.assertEqual(second.returncode, 3)
+        self.assertIn("duplicate", second.stderr)
+        self.assertEqual(second.stdout, "")
+
+        listing = self.invoke("billing", "list", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(len(json.loads(listing.stdout)), 1)
+
+    def test_generate_validates_dates(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+
+        bad_date = self.generate("--period-start", "2026-02-30", "--period-end", "2026-03-01")
+        self.assertEqual(bad_date.returncode, 2)
+        self.assertEqual(bad_date.stdout, "")
+
+        bad_end = self.generate("--period-start", "2026-01-01", "--period-end", "not-a-date")
+        self.assertEqual(bad_end.returncode, 2)
+        self.assertEqual(bad_end.stdout, "")
+
+        inverted = self.generate("--period-start", "2026-02-01", "--period-end", "2026-01-01")
+        self.assertEqual(inverted.returncode, 2)
+        self.assertEqual(inverted.stdout, "")
+
+    def test_generate_unknown_subscription_exits_4(self) -> None:
+        result = self.generate("--period-start", "2026-01-01", "--period-end", "2026-01-31")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_list_returns_bills_in_id_order_per_subscription(self) -> None:
+        self.assertEqual(self.create_subscription().returncode, 0)
+        self.assertEqual(self.create_subscription("c2", "pro").returncode, 0)
+        self.record("2026-01-10", 5)
+
+        first = self.generate("--period-start", "2026-01-01", "--period-end", "2026-01-15")
+        second = self.generate("--period-start", "2026-01-16", "--period-end", "2026-01-31")
+        other = self.invoke(
+            "billing", "generate", "--customer-id", "c2", "--plan", "pro",
+            "--period-start", "2026-01-01", "--period-end", "2026-01-31",
+        )
+        self.assertEqual(other.returncode, 0, other.stderr)
+        self.assertEqual(json.loads(other.stdout)["id"], 3)
+
+        listing = self.invoke("billing", "list", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertEqual(len(listing.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(listing.stdout),
+            [json.loads(first.stdout), json.loads(second.stdout)],
+        )
+
+        empty = self.invoke("billing", "list", "--customer-id", "c2", "--plan", "pro")
+        self.assertEqual(len(json.loads(empty.stdout)), 1)
+
+    def test_list_unknown_subscription_exits_4(self) -> None:
+        result = self.invoke("billing", "list", "--customer-id", "ghost", "--plan", "basic")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()

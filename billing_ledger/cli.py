@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import subscriptions, usage
+from . import billing, subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -75,6 +75,19 @@ def _build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
     reconcile.add_argument("--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
 
+    billing_parser = subparsers.add_parser("billing", help="生成与查询账单.")
+    billing_subparsers = billing_parser.add_subparsers(dest="billing_command")
+
+    generate = billing_subparsers.add_parser("generate", help="为某订阅生成一张计费周期账单.")
+    generate.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    generate.add_argument("--plan", required=True, help="订阅计划，非空.")
+    generate.add_argument("--period-start", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
+    generate.add_argument("--period-end", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
+
+    billing_list = billing_subparsers.add_parser("list", help="按 id 升序列出某订阅的全部账单.")
+    billing_list.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    billing_list.add_argument("--plan", required=True, help="订阅计划，非空.")
+
     return parser
 
 
@@ -142,6 +155,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 start_date=args.start_date,
                 end_date=args.end_date,
             )
+
+    if args.command == "billing":
+        if args.billing_command == "generate":
+            return billing.generate(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                period_start=args.period_start,
+                period_end=args.period_end,
+            )
+        if args.billing_command == "list":
+            return billing.list_bills(customer_id=args.customer_id, plan=args.plan)
 
     parser.print_help()
     return 0
