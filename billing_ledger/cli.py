@@ -55,6 +55,22 @@ def _build_parser() -> argparse.ArgumentParser:
     trial.add_argument("--customer-id", required=True, help="客户标识，非空.")
     trial.add_argument("--plan", required=True, help="订阅计划，非空.")
 
+    change = subscription_subparsers.add_parser(
+        "change", help="变更试用订阅的计划、价格或试用结束日期（整批原子生效）."
+    )
+    change.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    change.add_argument("--plan", required=True, help="当前订阅计划，非空.")
+    change.add_argument("--plan-new", default=None, help="新计划名，非空且须不同于当前计划.")
+    change.add_argument(
+        "--price-cents",
+        type=_non_negative_int,
+        default=None,
+        help="新价格，单位分，非负整数.",
+    )
+    change.add_argument(
+        "--trial-end-date", default=None, help="新试用结束日期（含），YYYY-MM-DD."
+    )
+
     activate = subscription_subparsers.add_parser("activate", help="试用转正.")
     activate.add_argument("--customer-id", required=True, help="客户标识，非空.")
     activate.add_argument("--plan", required=True, help="订阅计划，非空.")
@@ -141,6 +157,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return subscriptions.list_all()
         if args.subscription_command in ("trial", "get"):
             return subscriptions.get(customer_id=args.customer_id, plan=args.plan)
+        if args.subscription_command == "change":
+            return subscriptions.change(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                plan_new=args.plan_new,
+                price_cents=args.price_cents,
+                trial_end_date=args.trial_end_date,
+            )
         if args.subscription_command == "activate":
             return subscriptions.activate(
                 customer_id=args.customer_id,

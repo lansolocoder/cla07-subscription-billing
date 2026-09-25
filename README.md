@@ -58,6 +58,30 @@ python3 -m billing_ledger subscription activate \
 # {"customer_id":"c2","plan":"pro","status":"active","activated_on":"2026-01-15"}
 ```
 
+## 订阅变更
+
+```bash
+# 变更试用订阅：按 customer_id 与 plan 定位，--plan-new / --price-cents /
+# --trial-end-date 至少给一项，可多项同时指定、整批原子生效
+python3 -m billing_ledger subscription change \
+  --customer-id c2 --plan pro --plan-new enterprise --price-cents 2990 \
+  --trial-end-date 2026-01-20
+# {"customer_id":"c2","plan":"enterprise","trial_days":20,
+#  "trial_end_date":"2026-01-20","trial_to_active_date":"2026-01-21","status":"trial"}
+```
+
+- 仅状态为 `trial` 的订阅允许变更；`active` 订阅变更报错（stderr、退出码 2）。
+- `--plan-new` 须非空且不同于当前 plan；`--price-cents` 须为非负整数；
+  `--trial-end-date` 须为合法 `YYYY-MM-DD`，不早于 `start_date`、不早于今天 UTC，
+  也不早于当前试用结束日期。
+- 变更试用结束日期后，`trial_days` 按 `[start_date, 新结束日期]` 的天数重新计算，
+  转正日期为新结束日期加一天，`status` 仍为 `trial`。
+- 计划改名后按新组合定位；若 `customer_id` 与新计划名的组合已存在则整批拒绝、
+  不覆盖（stderr、退出码 4）；已录入的逐条用量与按日汇总不受影响。
+- 一次提交同时命中多类错误时按优先级报错：参数或日期非法、对 active 订阅变更、
+  新结束日期早于旧结束日期（均为 stderr、退出码 2），均未命中才判找不到订阅或
+  改名冲突（stderr、退出码 4）；任何失败都不写入数据。
+
 ## 用量录入
 
 ```bash

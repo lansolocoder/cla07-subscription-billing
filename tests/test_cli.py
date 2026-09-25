@@ -580,5 +580,250 @@ class TrialManagementTests(unittest.TestCase):
         self.assertEqual(second["trial_to_active_date"], "2026-01-15")
 
 
+class SubscriptionChangeTests(unittest.TestCase):
+    """End-to-end checks for changing plan, price or trial end date."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+        from datetime import datetime, timezone
+
+        self.today = datetime.now(timezone.utc).date()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def iso(self, offset_days: int) -> str:
+        from datetime import timedelta
+
+        return (self.today + timedelta(days=offset_days)).isoformat()
+
+    def create(self, *extra: str, customer_id: str = "c1", plan: str = "basic",
+               start_date: str | None = None) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", "990",
+            "--start-date", start_date or self.iso(-10),
+            *extra,
+        )
+
+    def create_trial(self, *extra: str, **kwargs: str) -> subprocess.CompletedProcess[str]:
+        result = self.create("--trial-end-date", self.iso(4), *extra, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def change(self, *extra: str, customer_id: str = "c1",
+               plan: str = "basic") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "subscription", "change",
+            "--customer-id", customer_id, "--plan", plan, *extra,
+        )
+
+    def trial(self, customer_id: str = "c1", plan: str = "basic") -> dict:
+        result = self.invoke(
+            "subscription", "trial", "--customer-id", customer_id, "--plan", plan
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_change_trial_end_date_recomputes_trial_fields(self) -> None:
+        self.create_trial()
+        result = self.change("--trial-end-date", self.iso(9))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "customer_id": "c1",
+                "plan": "basic",
+                "trial_days": 20,
+                "trial_end_date": self.iso(9),
+                "trial_to_active_date": self.iso(10),
+                "status": "trial",
+            },
+        )
+        # The trial query reads the new values back.
+        self.assertEqual(self.trial(), json.loads(result.stdout) | {"start_date": self.iso(-10)})
+
+    def test_change_plan_moves_subscription_and_keeps_usage(self) -> None:
+        self.create_trial()
+        recorded = self.invoke(
+            "usage", "record", "--customer-id", "c1", "--plan", "basic",
+            "--usage-date", self.iso(-2), "--quantity", "5",
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        result = self.change("--plan-new", "pro")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["plan"], "pro")
+        self.assertEqual(json.loads(result.stdout)["status"], "trial")
+
+        # The old locator no longer resolves; the new one does.
+        old = self.invoke("subscription", "trial", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(old.returncode, 4)
+        view = self.trial(plan="pro")
+        self.assertEqual(view["trial_end_date"], self.iso(4))
+        self.assertEqual(view["trial_to_active_date"], self.iso(5))
+
+        # Per-record and daily-summary usage survive the rename.
+        listing = self.invoke("usage", "list", "--customer-id", "c1", "--plan", "pro")
+        self.assertEqual(
+            json.loads(listing.stdout),
+            [{"id": 1, "usage_date": self.iso(-2), "quantity": 5}],
+        )
+        summary = self.invoke("usage", "summary", "--customer-id", "c1", "--plan", "pro")
+        self.assertEqual(
+            json.loads(summary.stdout),
+            [{"usage_date": self.iso(-2), "total": 5}],
+        )
+
+    def test_change_multiple_fields_applies_atomically(self) -> None:
+        self.create_trial()
+        result = self.change(
+            "--plan-new", "pro", "--price-cents", "1990",
+            "--trial-end-date", self.iso(6),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "customer_id": "c1",
+                "plan": "pro",
+                "trial_days": 17,
+                "trial_end_date": self.iso(6),
+                "trial_to_active_date": self.iso(7),
+                "status": "trial",
+            },
+        )
+        listing = self.invoke("subscription", "list")
+        (row,) = json.loads(listing.stdout)
+        self.assertEqual(row["price_cents"], 1990)
+        self.assertEqual(row["plan"], "pro")
+
+    def test_change_price_only(self) -> None:
+        self.create_trial()
+        result = self.change("--price-cents", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["plan"], "basic")
+        (row,) = json.loads(self.invoke("subscription", "list").stdout)
+        self.assertEqual(row["price_cents"], 0)
+
+    def test_change_requires_at_least_one_change_argument(self) -> None:
+        self.create_trial()
+        result = self.change()
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.trial()["trial_end_date"], self.iso(4))
+
+    def test_change_rejects_same_plan_and_empty_plan_new(self) -> None:
+        self.create_trial()
+        same = self.change("--plan-new", "basic")
+        self.assertEqual(same.returncode, 2)
+        self.assertEqual(same.stdout, "")
+        empty = self.change("--plan-new", "")
+        self.assertEqual(empty.returncode, 2)
+        self.assertEqual(empty.stdout, "")
+
+    def test_change_validates_trial_end_date(self) -> None:
+        self.create_trial()
+        bad_date = self.change("--trial-end-date", "2026-02-30")
+        self.assertEqual(bad_date.returncode, 2)
+        self.assertEqual(bad_date.stdout, "")
+
+        before_today = self.change("--trial-end-date", self.iso(-1))
+        self.assertEqual(before_today.returncode, 2)
+        self.assertIn("today", before_today.stderr)
+
+        before_start = self.change("--trial-end-date", self.iso(-11))
+        # iso(-11) is also before today; use a date between start and today.
+        self.assertEqual(before_start.returncode, 2)
+
+        before_old_end = self.change("--trial-end-date", self.iso(3))
+        self.assertEqual(before_old_end.returncode, 2)
+        self.assertIn(self.iso(4), before_old_end.stderr)
+
+        # Nothing was written by any failed change.
+        self.assertEqual(self.trial()["trial_end_date"], self.iso(4))
+
+    def test_change_trial_end_date_before_start_date_exits_2(self) -> None:
+        # start_date in the future relative to nothing: pick a start date of
+        # today so a valid (>= today) end date cannot precede it; instead use
+        # a start date earlier than today and an end date before start but
+        # that case is unreachable since end >= today > start. Construct via
+        # start_date == today and end == today (allowed, not earlier).
+        self.create("--trial-end-date", self.iso(0), start_date=self.iso(0))
+        ok = self.change("--trial-end-date", self.iso(0))
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout)["trial_days"], 1)
+
+    def test_change_active_subscription_exits_2(self) -> None:
+        self.create()  # no trial -> active
+        result = self.change("--price-cents", "100")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("trial", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        # Activated subscriptions cannot be changed either.
+        self.create("--trial-end-date", self.iso(4), customer_id="c2", plan="pro")
+        activated = self.invoke(
+            "subscription", "activate", "--customer-id", "c2", "--plan", "pro",
+            "--as-of", self.iso(5),
+        )
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        again = self.change("--price-cents", "100", customer_id="c2", plan="pro")
+        self.assertEqual(again.returncode, 2)
+
+    def test_change_unknown_subscription_exits_4(self) -> None:
+        result = self.change("--price-cents", "100")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_change_plan_conflict_exits_4_without_overwriting(self) -> None:
+        self.create_trial()
+        self.create("--trial-end-date", self.iso(6), plan="pro")
+        result = self.change("--plan-new", "pro")
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(result.stdout, "")
+        # Both subscriptions are untouched.
+        self.assertEqual(self.trial()["trial_end_date"], self.iso(4))
+        self.assertEqual(self.trial(plan="pro")["trial_end_date"], self.iso(6))
+
+    def test_error_priority_argument_errors_beat_lookup_errors(self) -> None:
+        # Invalid date + unknown subscription -> argument error wins (exit 2).
+        result = self.change("--trial-end-date", "not-a-date")
+        self.assertEqual(result.returncode, 2)
+
+        # Same plan + unknown subscription -> argument error wins (exit 2).
+        same = self.change("--plan-new", "basic")
+        self.assertEqual(same.returncode, 2)
+
+    def test_error_priority_active_beats_conflict(self) -> None:
+        self.create(customer_id="c1", plan="basic")  # active
+        self.create("--trial-end-date", self.iso(6), customer_id="c1", plan="pro")
+        result = self.change("--plan-new", "pro")
+        self.assertEqual(result.returncode, 2)
+
+    def test_error_priority_old_end_beats_conflict(self) -> None:
+        self.create_trial()
+        self.create("--trial-end-date", self.iso(6), plan="pro")
+        result = self.change("--plan-new", "pro", "--trial-end-date", self.iso(2))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.trial()["plan"], "basic")
+
+
 if __name__ == "__main__":
     unittest.main()

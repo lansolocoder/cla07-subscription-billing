@@ -245,6 +245,147 @@ def get(customer_id: str, plan: str) -> int:
     return 0
 
 
+def change(
+    customer_id: str,
+    plan: str,
+    plan_new: str | None = None,
+    price_cents: int | None = None,
+    trial_end_date: str | None = None,
+) -> int:
+    """Change plan, price and/or trial end date of a trial subscription.
+
+    All given changes apply atomically: any validation failure leaves the
+    subscription untouched. Only subscriptions still in ``trial`` status may
+    be changed. Error priority within one submission: invalid arguments or
+    dates first, then changing an active subscription, then a new trial end
+    date earlier than the current one (all exit 2); only if none of those
+    apply, an unknown subscription or a plan rename conflicting with an
+    existing subscription is reported (exit 4).
+    """
+    if not customer_id:
+        return _fail("--customer-id must not be empty")
+    if not plan:
+        return _fail("--plan must not be empty")
+    if plan_new is None and price_cents is None and trial_end_date is None:
+        return _fail(
+            "at least one of --plan-new, --price-cents or --trial-end-date"
+            " must be given"
+        )
+    if plan_new is not None:
+        if not plan_new:
+            return _fail("--plan-new must not be empty")
+        if plan_new == plan:
+            return _fail(f"--plan-new must differ from the current plan: {plan}")
+    if price_cents is not None and price_cents < 0:
+        return _fail("--price-cents must be a non-negative integer")
+
+    parsed_end: date | None = None
+    if trial_end_date is not None:
+        parsed_end = _parse_start_date(trial_end_date)
+        if parsed_end is None:
+            return _fail(
+                f"--trial-end-date is not a valid YYYY-MM-DD date: {trial_end_date}"
+            )
+        today = datetime.now(timezone.utc).date()
+        if parsed_end < today:
+            return _fail(
+                "--trial-end-date must not be earlier than today (UTC): "
+                f"{trial_end_date}"
+            )
+
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT id, start_date, trial_days, status, trial_end_date,"
+            " trial_to_active_date FROM subscriptions"
+            " WHERE customer_id = ? AND plan = ?",
+            (customer_id, plan),
+        ).fetchone()
+        if row is None:
+            print(
+                "billing-ledger: no subscription found for"
+                f" customer_id={customer_id} plan={plan}",
+                file=sys.stderr,
+            )
+            return 4
+        (
+            subscription_id,
+            start_date,
+            current_trial_days,
+            status,
+            current_trial_end,
+            current_conversion,
+        ) = row
+
+        if parsed_end is not None and parsed_end < _parse_start_date(str(start_date)):
+            return _fail(
+                "--trial-end-date must not be earlier than start_date "
+                f"{start_date}: {trial_end_date}"
+            )
+        if status != "trial":
+            return _fail(
+                "only trial subscriptions can be changed:"
+                f" customer_id={customer_id} plan={plan} status={status}"
+            )
+        if parsed_end is not None and current_trial_end is not None:
+            if parsed_end < _parse_start_date(str(current_trial_end)):
+                return _fail(
+                    "--trial-end-date must not be earlier than the current"
+                    f" trial_end_date {current_trial_end}: {trial_end_date}"
+                )
+        if plan_new is not None:
+            conflict = connection.execute(
+                "SELECT 1 FROM subscriptions WHERE customer_id = ? AND plan = ?",
+                (customer_id, plan_new),
+            ).fetchone()
+            if conflict is not None:
+                print(
+                    "billing-ledger: conflicting subscription for"
+                    f" customer_id={customer_id} plan={plan_new}",
+                    file=sys.stderr,
+                )
+                return 4
+
+        new_plan = plan_new if plan_new is not None else plan
+        new_price = price_cents if price_cents is not None else None
+        if parsed_end is not None:
+            start = _parse_start_date(str(start_date))
+            new_trial_days = (parsed_end - start).days + 1
+            new_trial_end = trial_end_date
+            new_conversion = (parsed_end + timedelta(days=1)).isoformat()
+        else:
+            new_trial_days = int(current_trial_days)
+            new_trial_end = current_trial_end
+            new_conversion = current_conversion
+
+        assignments = ["plan = ?", "trial_days = ?", "trial_end_date = ?",
+                       "trial_to_active_date = ?"]
+        parameters: list[object] = [new_plan, new_trial_days, new_trial_end,
+                                    new_conversion]
+        if new_price is not None:
+            assignments.append("price_cents = ?")
+            parameters.append(new_price)
+        parameters.append(subscription_id)
+        connection.execute(
+            f"UPDATE subscriptions SET {', '.join(assignments)} WHERE id = ?",
+            parameters,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    record = {
+        "customer_id": customer_id,
+        "plan": new_plan,
+        "trial_days": new_trial_days,
+        "trial_end_date": new_trial_end,
+        "trial_to_active_date": new_conversion,
+        "status": status,
+    }
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
 def activate(customer_id: str, plan: str, as_of: str | None = None) -> int:
     """Convert a trial subscription to active status.
 
