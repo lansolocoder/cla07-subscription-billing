@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import subscriptions, usage
+from . import invoices, subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -75,6 +75,23 @@ def _build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
     reconcile.add_argument("--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
 
+    invoice = subparsers.add_parser("invoice", help="生成与查询账单.")
+    invoice_subparsers = invoice.add_subparsers(dest="invoice_command")
+
+    invoice_generate = invoice_subparsers.add_parser("generate", help="为计费周期生成一张账单.")
+    invoice_generate.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    invoice_generate.add_argument("--plan", required=True, help="订阅计划，非空.")
+    invoice_generate.add_argument(
+        "--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD."
+    )
+    invoice_generate.add_argument(
+        "--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD."
+    )
+
+    invoice_list = invoice_subparsers.add_parser("list", help="按 id 升序列出某订阅的全部账单.")
+    invoice_list.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    invoice_list.add_argument("--plan", required=True, help="订阅计划，非空.")
+
     return parser
 
 
@@ -141,6 +158,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plan=args.plan,
                 start_date=args.start_date,
                 end_date=args.end_date,
+            )
+
+    if args.command == "invoice":
+        if args.invoice_command == "generate":
+            return invoices.generate(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+        if args.invoice_command == "list":
+            return invoices.list_for_subscription(
+                customer_id=args.customer_id,
+                plan=args.plan,
             )
 
     parser.print_help()

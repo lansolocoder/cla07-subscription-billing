@@ -88,5 +88,37 @@ python3 -m billing_ledger usage reconcile --customer-id c1 --plan basic \
 - 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
   找不到匹配的订阅组合：stderr、退出码 4。
 
+## 账单生成与查询
+
+```bash
+# 对订阅计费周期 [start-date, end-date]（闭区间）生成账单
+# 成功时 stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger invoice generate --customer-id c1 --plan basic \
+  --start-date 2026-01-01 --end-date 2026-01-31
+# {"id":1,"subscription_id":1,"period_start":"2026-01-01","period_end":"2026-01-31",
+#  "billed_days":24,"trial_days_in_period":7,"amount_cents":23760,"usage_total":8}
+
+# 按 id 升序输出该订阅全部账单（单行 JSON 数组，元素形状同上并含 id）
+python3 -m billing_ledger invoice list --customer-id c1 --plan basic
+# [{"id":1,...}]
+```
+
+计费规则：
+
+- 日单价取订阅登记时的 `price-cents`；自订阅 `start_date` 起连续 `trial_days` 天
+  （`[start_date, start_date + trial_days - 1]`）为试用期，试用覆盖日期计费金额为 0，
+  其余日期按日单价计费。试用期可跨出周期边界，仅周期内被覆盖的日期免计费；
+  `trial_days_in_period` 即周期内落在试用窗口内的日期数。
+- `billed_days` 为周期总天数减去 `trial_days_in_period`；
+  `amount_cents = billed_days × price-cents`，全部为整数分。
+- `usage_total` 为周期内同订阅用量合计：同日期多条用量求和，无记录日期计 0；
+  用量日期是否在试用期内不影响用量合计。
+- 账单号 `id` 在同一数据库中全局唯一、单调分配（SQLite AUTOINCREMENT）、跨进程稳定。
+- 同一订阅同一周期（`period_start`、`period_end` 均相同）仅允许一张账单：
+  重复生成整单拒绝，stderr 提示重复、退出码 3，不写入数据（账单号不被消耗）。
+- 日期非法或 `start-date` 晚于 `end-date`：stderr、退出码 2，不写入数据。
+- 找不到匹配的 `customer_id` 与 `plan` 订阅组合：stderr、退出码 4，不写入数据。
+- `invoice list` 同样在订阅不存在时 stderr、退出码 4；生成失败后查询结果保持不变。
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
-尚未实现账单生成以及收款核对与差异归集。
+尚未实现收款核对与差异归集。
