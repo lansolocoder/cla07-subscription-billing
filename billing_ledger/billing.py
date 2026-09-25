@@ -132,7 +132,9 @@ def generate(customer_id: str, plan: str, period_start: str, period_end: str) ->
         quantity = _billable_quantity(
             connection, subscription_id, period_start, period_end, start_date, trial_days
         )
-        segments = -(-quantity // _BILLING_UNIT)
+        # Zero billable usage (e.g. the whole period falls inside the trial
+        # window) bills 0 segments; positive usage rounds up per 100 units.
+        segments = 0 if quantity == 0 else -(-quantity // _BILLING_UNIT)
         amount_cents = segments * price_cents
 
         try:

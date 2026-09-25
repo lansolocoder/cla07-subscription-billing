@@ -104,12 +104,36 @@ python3 -m billing_ledger billing list --customer-id c1 --plan basic
 
 - 计费规则：`billable_quantity` 为周期内该订阅全部用量记录（同日多条求和）之和，
   但试用期（`start_date` 当天为第 1 天、连续 `trial_days` 天）内的用量不计费；
-  其余用量每 100 单位向上取整为 1 个计费段（不足 100 记 1 段），
+  可计费用量大于 0 时每 100 单位向上取整为 1 个计费段（不足 100 记 1 段），
+  可计费用量为 0（如周期全在试用期内）时 `billable_quantity`、`amount_cents` 均为 0；
   `amount_cents` = 段数 × `price_cents`。周期允许早于订阅 `start_date`，这些日期用量为 0。
 - 账单与订阅、用量同库持久化；`id` 全局唯一、单调分配。
 - 同一订阅同一 `(period_start, period_end)` 重复生成：stderr、退出码 3，不写入任何记录。
 - 日期非法或 `period-start` 晚于 `period-end`：stderr、退出码 2；
   找不到匹配的订阅组合：stderr、退出码 4。任何失败均不改动既有账单与用量数据。
 
+## 收款登记与差异归集
+
+```bash
+# 登记一笔收款并匹配到指定账单，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger billing payment --customer-id c1 --plan basic \
+  --bill-id 1 --amount-cents 990 --payment-ref pay-2026-001
+# {"id":1,"bill_id":1,"amount_cents":990,"payment_ref":"pay-2026-001","status":"applied"}
+
+# 读回指定账单的收款合计与差异，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger billing payment-status --customer-id c1 --plan basic --bill-id 1
+# {"bill_id":1,"amount_cents":990,"paid_cents":990,"balance_cents":0,"status":"paid"}
+```
+
+- 收款与订阅、用量、账单同库持久化；`id` 全局唯一、单调分配。
+  `bill-id` 须属于该订阅，`amount-cents` 为 ≥1 整数，`payment-ref` 非空。
+- 同一 `payment-ref` 全库只允许匹配一次（含原样重跑）：stderr、退出码 3，
+  不写新记录、不改动既有数据。同一账单可累计多笔收款。
+- `payment-status` 中 `paid_cents` 为该账单收款合计，`balance_cents` =
+  `amount_cents` − `paid_cents`（可为负）；`status` 仅按 `balance_cents` 取值：
+  大于 0 为 `unpaid`，等于 0 为 `paid`，小于 0 为 `overpaid`。
+- 参数或金额非法：stderr、退出码 2；重复流水号：stderr、退出码 3；
+  找不到订阅或账单（含 `bill-id` 不属该订阅）：stderr、退出码 4。
+  任何失败均不改动既有账单、收款与用量数据。
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
-尚未实现收款核对与差异归集。
