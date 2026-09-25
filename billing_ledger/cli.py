@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import subscriptions, usage
+from . import invoices, subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -75,6 +75,28 @@ def _build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
     reconcile.add_argument("--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
 
+    invoice = subparsers.add_parser("invoice", help="生成账单与登记按比例折扣.")
+    invoice_subparsers = invoice.add_subparsers(dest="invoice_command")
+
+    generate = invoice_subparsers.add_parser("generate", help="按计费周期生成账单（同业务键幂等）.")
+    generate.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    generate.add_argument("--plan", required=True, help="订阅计划，非空.")
+    generate.add_argument("--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
+    generate.add_argument("--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
+
+    register_discount = invoice_subparsers.add_parser(
+        "register-discount", help="为某账单业务键登记一次按比例折扣（0–100 的整数百分点）."
+    )
+    register_discount.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    register_discount.add_argument("--plan", required=True, help="订阅计划，非空.")
+    register_discount.add_argument("--start-date", required=True, help="计费周期起始日期（含），YYYY-MM-DD.")
+    register_discount.add_argument("--end-date", required=True, help="计费周期结束日期（含），YYYY-MM-DD.")
+    register_discount.add_argument(
+        "--discount-percent",
+        required=True,
+        help="折扣百分点，0–100 的整数；例如 20 表示按八折计费.",
+    )
+
     return parser
 
 
@@ -141,6 +163,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plan=args.plan,
                 start_date=args.start_date,
                 end_date=args.end_date,
+            )
+
+    if args.command == "invoice":
+        if args.invoice_command == "generate":
+            return invoices.generate(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+        if args.invoice_command == "register-discount":
+            try:
+                discount_percent = int(args.discount_percent)
+            except ValueError:
+                print(
+                    "billing-ledger: error: --discount-percent must be an integer between 0"
+                    f" and 100: {args.discount_percent!r}",
+                    file=sys.stderr,
+                )
+                return 3
+            return invoices.register_discount(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                discount_percent=discount_percent,
             )
 
     parser.print_help()

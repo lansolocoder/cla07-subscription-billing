@@ -88,5 +88,50 @@ python3 -m billing_ledger usage reconcile --customer-id c1 --plan basic \
 - 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
   找不到匹配的订阅组合：stderr、退出码 4。
 
-所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
-尚未实现账单生成以及收款核对与差异归集。
+## 账单生成
+
+```bash
+# 为闭区间 [start-date, end-date] 生成账单；成功时 stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger invoice generate --customer-id c1 --plan basic \
+  --start-date 2026-01-01 --end-date 2026-01-31
+# {"invoice_id":1,"customer_id":"c1","plan":"basic","period_start":"2026-01-01",
+#  "period_end":"2026-01-31","billed_usage":80,"subtotal_cents":79200,
+#  "discount_percent":0,"total_cents":79200,"trailing_days":7}
+```
+
+- 业务键为 `(customer_id, plan, period_start, period_end)`：同参数重复生成
+  幂等返回既有账单（含首次分配的 `invoice_id`），不重复计费、不重新计价；
+  不同周期互不影响。
+- `invoice_id` 在同一数据库中全局唯一、单调分配（SQLite AUTOINCREMENT）。
+- 周期内同一日期的多条用量记录先按日求和，再对计费用量求和；
+  `billed_usage` 为计费用量总量，`subtotal_cents = billed_usage × price_cents`。
+- 自订阅 `start_date`（含当天）起连续 `trial_days` 天为试用，试用日用量
+  不计费，试用结束次日起计费。`trailing_days` 为试用区间与本周期的重叠
+  日期数；试用区间与周期不重叠时为 0。
+- 周期起止无须早于/晚于订阅 `start_date`：试用只按其与周期的实际重叠生效。
+- 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
+  找不到匹配的订阅组合：stderr、退出码 4。
+
+### 按比例折扣登记
+
+```bash
+# 为指定账单业务键登记一次折扣；成功无 stdout 输出，退出码 0
+python3 -m billing_ledger invoice register-discount --customer-id c1 --plan basic \
+  --start-date 2026-01-01 --end-date 2026-01-31 --discount-percent 20
+```
+
+- 折扣为 0–100 的整数百分点；20 表示按八折计费。每个业务键至多登记一次，
+  重复登记拒绝（stderr、退出码 3），原折扣保持不变；未登记按 0。
+- 仅当折扣前金额（`billed_usage × price_cents`，同样剔除试用日）严格大于 0
+  时才可登记，否则 stderr、退出码 3。
+- `--discount-percent` 非整数或越界：stderr、退出码 3；
+  日期非法或起止颠倒：stderr、退出码 3；找不到订阅：stderr、退出码 4。
+- 任一失败都不写入折扣记录。
+- 折扣可在账单生成之前或之后登记：已生成账单的值不会被追溯改写；之后首次
+  生成的账单按
+  `total_cents = subtotal_cents × (100 − discount_percent) ÷ 100`
+  向下取整到整数分。
+
+所有成功与查询输出均写入 stdout 且为单行 JSON（折扣登记成功无输出）；
+错误信息写入 stderr。
+收款核对与差异归集尚未实现。
