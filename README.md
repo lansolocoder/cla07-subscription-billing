@@ -88,5 +88,28 @@ python3 -m billing_ledger usage reconcile --customer-id c1 --plan basic \
 - 日期非法或 `start_date` 晚于 `end_date`：stderr、退出码 2；
   找不到匹配的订阅组合：stderr、退出码 4。
 
+## 账单生成与查询
+
+```bash
+# 为某订阅生成 [period-start, period-end] 闭区间账单，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger billing generate --customer-id c1 --plan basic \
+  --period-start 2026-01-01 --period-end 2026-01-31
+# {"id":1,"subscription_id":1,"period_start":"2026-01-01","period_end":"2026-01-31",
+#  "billable_quantity":8,"amount_cents":990,"status":"issued"}
+
+# 按 id 升序列出该订阅的全部账单（单行 JSON 数组）
+python3 -m billing_ledger billing list --customer-id c1 --plan basic
+```
+
+- `billable_quantity` 为周期内该订阅全部用量记录之和（同日多条求和）；试用期
+  （`start_date` 起连续 `trial_days` 天，`start_date` 当天为第 1 天）内的用量不计费。
+- 其余用量按每 100 单位向上取整为 1 个计费段（不足 100 记 1 段），
+  `amount_cents = 段数 × price_cents`。
+- 周期允许早于订阅 `start_date`，这些日期的计费用量按 0 计。
+- 账单与订阅、用量同库持久化；`id` 全局唯一、单调分配；同一订阅同一
+  `(period_start, period_end)` 不允许重复生成，第二次执行写 stderr、退出码 3，不写入数据。
+- 日期非法或 `period_start` 晚于 `period_end`：stderr、退出码 2；
+  找不到匹配的订阅组合：stderr、退出码 4。任何失败均不改动既有账单与用量数据。
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
-尚未实现账单生成以及收款核对与差异归集。
+尚未实现收款核对与差异归集。
