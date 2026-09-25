@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from . import bills, subscriptions, usage
+from . import bills, payments, subscriptions, usage
 
 
 def _non_negative_int(raw: str) -> int:
@@ -15,6 +15,16 @@ def _non_negative_int(raw: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid non-negative integer: {raw!r}")
     if value < 0:
         raise argparse.ArgumentTypeError(f"must be a non-negative integer: {raw!r}")
+    return value
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {raw!r}")
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer: {raw!r}")
     return value
 
 
@@ -127,6 +137,27 @@ def _build_parser() -> argparse.ArgumentParser:
     bill_list.add_argument("--customer-id", required=True, help="客户标识，非空.")
     bill_list.add_argument("--plan", required=True, help="订阅计划，非空.")
 
+    payment = subparsers.add_parser("payment", help="收款登记与账单结清核对.")
+    payment_subparsers = payment.add_subparsers(dest="payment_command")
+
+    payment_record = payment_subparsers.add_parser("record", help="登记一笔收款.")
+    payment_record.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    payment_record.add_argument("--plan", required=True, help="订阅计划，非空.")
+    payment_record.add_argument("--bill-id", required=True, type=int, help="账单号，正整数.")
+    payment_record.add_argument(
+        "--amount-cents",
+        required=True,
+        type=_positive_int,
+        help="收款金额，单位分，正整数.",
+    )
+    payment_record.add_argument("--payment-date", required=True, help="收款日期，YYYY-MM-DD.")
+    payment_record.add_argument("--reference", required=True, help="收款凭证号，全局唯一、非空.")
+
+    payment_match = payment_subparsers.add_parser("match", help="按登记顺序逐笔核对某账单的收款.")
+    payment_match.add_argument("--bill-id", required=True, type=int, help="账单号，正整数.")
+
+    payment_subparsers.add_parser("list", help="按登记顺序列出全部收款.")
+
     return parser
 
 
@@ -222,6 +253,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.bill_command == "list":
             return bills.list_bills(customer_id=args.customer_id, plan=args.plan)
+
+    if args.command == "payment":
+        if args.payment_command == "record":
+            return payments.record(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                bill_id=args.bill_id,
+                amount_cents=args.amount_cents,
+                payment_date=args.payment_date,
+                reference=args.reference,
+            )
+        if args.payment_command == "match":
+            return payments.match(bill_id=args.bill_id)
+        if args.payment_command == "list":
+            return payments.list_payments()
 
     parser.print_help()
     return 0

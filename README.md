@@ -172,7 +172,55 @@ python3 -m billing_ledger bill list --customer-id c1 --plan basic
 - `--period-start` / `--period-end` 须为合法 `YYYY-MM-DD` 闭区间，起始晚于结束为参数错误
   （stderr、退出码 2，不写入数据）；找不到匹配的订阅组合为 stderr、退出码 4。
 
+## 收款登记
+
+```bash
+# 为已生成的账单登记一笔收款，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger payment record \
+  --customer-id c1 --plan basic --bill-id 1 \
+  --amount-cents 500 --payment-date 2026-02-05 --reference r1
+# {"id":1,"bill_id":1,"customer_id":"c1","plan":"basic","reference":"r1",
+#  "amount_cents":500,"payment_date":"2026-02-05","status":"applied"}
+```
+
+- 收款与账单同库持久化；收款号在同一数据库中全局唯一、单调分配、跨进程稳定。
+- `--bill-id` 指向的账单须存在，且归属给定的 `--customer-id` 与 `--plan`：
+  账单不存在或不属于该客户与计划时 stderr、退出码 4，不写入数据。
+- `--amount-cents` 须为正整数；`--payment-date` 须为合法 `YYYY-MM-DD`：
+  参数或日期非法时 stderr、退出码 2，不写入数据。
+- `--reference` 须非空且全局唯一（跨全部账单）：重复登记同一凭证号时 stderr、
+  退出码 5，不覆盖既有收款、不写入数据。
+
+## 收款结清核对
+
+```bash
+# 按登记顺序逐笔核销 --bill-id 指向的账单：先逐笔输出核销行，再输出一行汇总
+python3 -m billing_ledger payment match --bill-id 1
+# {"bill_id":1,"reference":"r1","amount_cents":500,"applied_cents":500,"result":"settled"}
+# {"bill_id":1,"total_cents":1070,"paid_cents":1070,"status":"paid"}
+```
+
+- 核销为只读计算、幂等：重复执行输出完全相同，核销额不会重复累计，也不写入任何数据。
+- `applied_cents` 为该笔收款实际核销的金额：按登记顺序逐笔冲抵账单 `total_cents`，
+  累计达到 `total_cents` 的一笔为最后一笔有效核销，超出部分只计到恰好结清；
+  其后各笔 `result` 为 `overpaid`、`applied_cents` 为 0。
+- 累计已达 `total_cents` 的最后一笔 `result` 为 `settled`；累计不足时最后一笔
+  有效核销 `result` 为 `underpaid`（其余未结清各笔同为 `underpaid`）。
+- 汇总中 `paid_cents` 为实际核销总额；恰好结清为 `paid`，累计不足为 `open`，
+  存在结清后的超收收款为 `partial`（`paid_cents` 仍等于 `total_cents`）。
+- 账单不存在时 stderr、退出码 4；该账单没有任何收款时仅输出汇总一行，
+  `paid_cents` 为 0、`status` 为 `open`。
+
+## 收款查询
+
+```bash
+# 按登记顺序（id 升序）输出全部收款的单行 JSON 数组；无收款时输出 []
+python3 -m billing_ledger payment list
+# [{"id":1,"bill_id":1,"customer_id":"c1","plan":"basic","reference":"r1",
+#   "amount_cents":500,"payment_date":"2026-02-05","status":"applied"},...]
+```
+
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
 退出码约定：参数或日期非法为 2（不写入数据）；重复登记同一 `customer_id` 与 `plan`
-组合为 3（不覆盖已有订阅）；找不到匹配的订阅组合为 4；成功为 0。
-尚未实现收款核对与差异归集。
+组合为 3（不覆盖已有订阅）；找不到匹配的订阅或账单为 4；收款凭证号 `--reference`
+重复登记为 5（不覆盖既有收款）；成功为 0。

@@ -1053,5 +1053,363 @@ class BillGenerationTests(unittest.TestCase):
         self.assertEqual([bill["id"] for bill in c2_bills], [2])
 
 
+class PaymentTests(unittest.TestCase):
+    """End-to-end checks for payment registration, matching and listing."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create_subscription(
+        self, customer_id: str = "c1", plan: str = "basic"
+    ) -> None:
+        result = self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", "990",
+            "--start-date", "2026-01-01",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def record_usage(self, quantity: int, customer_id: str = "c1",
+                    plan: str = "basic", usage_date: str = "2026-01-10") -> None:
+        result = self.invoke(
+            "usage", "record",
+            "--customer-id", customer_id, "--plan", plan,
+            "--usage-date", usage_date, "--quantity", str(quantity),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def generate_bill(self, customer_id: str = "c1", plan: str = "basic") -> int:
+        result = self.invoke(
+            "bill", "generate",
+            "--customer-id", customer_id, "--plan", plan,
+            "--period-start", "2026-01-01", "--period-end", "2026-01-31",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return int(json.loads(result.stdout)["id"])
+
+    def pay(self, bill_id: int, reference: str, amount: int,
+            payment_date: str = "2026-02-05", customer_id: str = "c1",
+            plan: str = "basic") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "payment", "record",
+            "--customer-id", customer_id, "--plan", plan,
+            "--bill-id", str(bill_id),
+            "--amount-cents", str(amount),
+            "--payment-date", payment_date,
+            "--reference", reference,
+        )
+
+    def _payment_count(self) -> int:
+        import sqlite3
+
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='payments'"
+            ).fetchall()
+            if not rows:
+                return 0
+            return int(connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0])
+
+    def _setup_bill(self) -> int:
+        # 990 base + 8 usage units * 10 cents = total_cents 1070.
+        self.create_subscription()
+        self.record_usage(5)
+        self.record_usage(3)
+        return self.generate_bill()
+
+    def test_record_payment_outputs_one_json_line(self) -> None:
+        bill_id = self._setup_bill()
+        result = self.pay(bill_id, "r1", 500)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"id": 1, "bill_id": bill_id, "customer_id": "c1", "plan": "basic",
+             "reference": "r1", "amount_cents": 500,
+             "payment_date": "2026-02-05", "status": "applied"},
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_record_unknown_or_mismatched_bill_exits_4(self) -> None:
+        bill_id = self._setup_bill()
+
+        missing = self.pay(999, "r1", 500)
+        self.assertEqual(missing.returncode, 4)
+        self.assertIn("no bill", missing.stderr)
+        self.assertEqual(missing.stdout, "")
+
+        wrong_customer = self.pay(bill_id, "r1", 500, customer_id="ghost")
+        self.assertEqual(wrong_customer.returncode, 4)
+        self.assertIn("no bill", wrong_customer.stderr)
+        self.assertEqual(wrong_customer.stdout, "")
+
+        wrong_plan = self.pay(bill_id, "r1", 500, plan="pro")
+        self.assertEqual(wrong_plan.returncode, 4)
+        self.assertEqual(wrong_plan.stdout, "")
+
+        self.assertEqual(self._payment_count(), 0)
+
+    def test_record_validates_amount_and_date(self) -> None:
+        bill_id = self._setup_bill()
+
+        zero = self.pay(bill_id, "r1", 0)
+        self.assertEqual(zero.returncode, 2)
+        self.assertEqual(zero.stdout, "")
+
+        negative = self.invoke(
+            "payment", "record",
+            "--customer-id", "c1", "--plan", "basic", "--bill-id", str(bill_id),
+            "--amount-cents", "-5", "--payment-date", "2026-02-05",
+            "--reference", "r1",
+        )
+        self.assertEqual(negative.returncode, 2)
+        self.assertEqual(negative.stdout, "")
+
+        not_integer = self.invoke(
+            "payment", "record",
+            "--customer-id", "c1", "--plan", "basic", "--bill-id", str(bill_id),
+            "--amount-cents", "1.5", "--payment-date", "2026-02-05",
+            "--reference", "r1",
+        )
+        self.assertEqual(not_integer.returncode, 2)
+        self.assertEqual(not_integer.stdout, "")
+
+        bad_date = self.pay(bill_id, "r1", 500, payment_date="2026-02-30")
+        self.assertEqual(bad_date.returncode, 2)
+        self.assertIn("YYYY-MM-DD", bad_date.stderr)
+        self.assertEqual(bad_date.stdout, "")
+
+        empty_reference = self.invoke(
+            "payment", "record",
+            "--customer-id", "c1", "--plan", "basic", "--bill-id", str(bill_id),
+            "--amount-cents", "500", "--payment-date", "2026-02-05",
+            "--reference", "",
+        )
+        self.assertEqual(empty_reference.returncode, 2)
+        self.assertEqual(empty_reference.stdout, "")
+
+        self.assertEqual(self._payment_count(), 0)
+
+    def test_duplicate_reference_exits_5_without_overwriting(self) -> None:
+        first_bill = self._setup_bill()
+        self.create_subscription("c2", "pro")
+        second_bill = self.generate_bill("c2", "pro")
+
+        first = self.pay(first_bill, "dup-ref", 500)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(json.loads(first.stdout)["id"], 1)
+
+        same_bill = self.pay(first_bill, "dup-ref", 600,
+                             payment_date="2026-02-06")
+        self.assertEqual(same_bill.returncode, 5)
+        self.assertIn("duplicate", same_bill.stderr)
+        self.assertEqual(same_bill.stdout, "")
+
+        other_bill = self.pay(second_bill, "dup-ref", 600,
+                              customer_id="c2", plan="pro")
+        self.assertEqual(other_bill.returncode, 5)
+        self.assertEqual(other_bill.stdout, "")
+
+        self.assertEqual(self._payment_count(), 1)
+        listing = json.loads(self.invoke("payment", "list").stdout)
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["amount_cents"], 500)
+        self.assertEqual(listing[0]["payment_date"], "2026-02-05")
+
+    def test_payment_ids_are_global_and_monotonic(self) -> None:
+        first_bill = self._setup_bill()
+        self.create_subscription("c2", "pro")
+        second_bill = self.generate_bill("c2", "pro")
+
+        first = self.pay(first_bill, "r1", 100)
+        second = self.pay(second_bill, "r2", 200, customer_id="c2", plan="pro")
+        third = self.pay(first_bill, "r3", 300)
+        self.assertEqual([json.loads(r.stdout)["id"] for r in (first, second, third)],
+                         [1, 2, 3])
+
+    def test_match_exact_single_payment_settles(self) -> None:
+        bill_id = self._setup_bill()
+        self.assertEqual(self.pay(bill_id, "r1", 1070).returncode, 0)
+
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                {"bill_id": bill_id, "reference": "r1", "amount_cents": 1070,
+                 "applied_cents": 1070, "result": "settled"},
+                {"bill_id": bill_id, "total_cents": 1070,
+                 "paid_cents": 1070, "status": "paid"},
+            ],
+        )
+
+    def test_match_multiple_payments_settle_exactly(self) -> None:
+        bill_id = self._setup_bill()
+        self.assertEqual(self.pay(bill_id, "r1", 500).returncode, 0)
+        self.assertEqual(self.pay(bill_id, "r2", 570).returncode, 0)
+
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                {"bill_id": bill_id, "reference": "r1", "amount_cents": 500,
+                 "applied_cents": 500, "result": "underpaid"},
+                {"bill_id": bill_id, "reference": "r2", "amount_cents": 570,
+                 "applied_cents": 570, "result": "settled"},
+                {"bill_id": bill_id, "total_cents": 1070,
+                 "paid_cents": 1070, "status": "paid"},
+            ],
+        )
+
+    def test_match_caps_overpaying_payment_to_exact_settlement(self) -> None:
+        bill_id = self._setup_bill()
+        self.assertEqual(self.pay(bill_id, "r1", 500).returncode, 0)
+        self.assertEqual(self.pay(bill_id, "r2", 500).returncode, 0)
+        self.assertEqual(self.pay(bill_id, "r3", 200).returncode, 0)
+
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                {"bill_id": bill_id, "reference": "r1", "amount_cents": 500,
+                 "applied_cents": 500, "result": "underpaid"},
+                {"bill_id": bill_id, "reference": "r2", "amount_cents": 500,
+                 "applied_cents": 500, "result": "underpaid"},
+                {"bill_id": bill_id, "reference": "r3", "amount_cents": 200,
+                 "applied_cents": 70, "result": "settled"},
+                {"bill_id": bill_id, "total_cents": 1070,
+                 "paid_cents": 1070, "status": "paid"},
+            ],
+        )
+
+    def test_match_later_payments_after_settlement_are_overpaid(self) -> None:
+        bill_id = self._setup_bill()
+        for reference, amount in [("r1", 1070), ("r2", 100), ("r3", 200)]:
+            self.assertEqual(self.pay(bill_id, reference, amount).returncode, 0)
+
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                {"bill_id": bill_id, "reference": "r1", "amount_cents": 1070,
+                 "applied_cents": 1070, "result": "settled"},
+                {"bill_id": bill_id, "reference": "r2", "amount_cents": 100,
+                 "applied_cents": 0, "result": "overpaid"},
+                {"bill_id": bill_id, "reference": "r3", "amount_cents": 200,
+                 "applied_cents": 0, "result": "overpaid"},
+                {"bill_id": bill_id, "total_cents": 1070,
+                 "paid_cents": 1070, "status": "partial"},
+            ],
+        )
+
+    def test_match_underpaid_bill_stays_open(self) -> None:
+        bill_id = self._setup_bill()
+        self.assertEqual(self.pay(bill_id, "r1", 500).returncode, 0)
+        self.assertEqual(self.pay(bill_id, "r2", 400).returncode, 0)
+
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                {"bill_id": bill_id, "reference": "r1", "amount_cents": 500,
+                 "applied_cents": 500, "result": "underpaid"},
+                {"bill_id": bill_id, "reference": "r2", "amount_cents": 400,
+                 "applied_cents": 400, "result": "underpaid"},
+                {"bill_id": bill_id, "total_cents": 1070,
+                 "paid_cents": 900, "status": "open"},
+            ],
+        )
+
+    def test_match_without_payments_outputs_only_summary(self) -> None:
+        bill_id = self._setup_bill()
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(
+            json.loads(lines[0]),
+            {"bill_id": bill_id, "total_cents": 1070,
+             "paid_cents": 0, "status": "open"},
+        )
+
+    def test_match_unknown_bill_exits_4(self) -> None:
+        result = self.invoke("payment", "match", "--bill-id", "999")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no bill", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_match_is_idempotent_and_does_not_write(self) -> None:
+        bill_id = self._setup_bill()
+        for reference, amount in [("r1", 500), ("r2", 1000), ("r3", 100)]:
+            self.assertEqual(self.pay(bill_id, reference, amount).returncode, 0)
+
+        first = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        snapshot = self.db_path.read_bytes()
+        second = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(second.stdout, first.stdout)
+        self.assertEqual(self.db_path.read_bytes(), snapshot)
+
+        third = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(third.stdout, first.stdout)
+        lines = [json.loads(line) for line in first.stdout.splitlines()]
+        self.assertEqual(lines[-1]["paid_cents"], 1070)
+        self.assertEqual(lines[-1]["status"], "partial")
+
+    def test_list_outputs_payments_in_registration_order(self) -> None:
+        empty = self.invoke("payment", "list")
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual(json.loads(empty.stdout), [])
+
+        first_bill = self._setup_bill()
+        self.create_subscription("c2", "pro")
+        second_bill = self.generate_bill("c2", "pro")
+        self.assertEqual(self.pay(first_bill, "r1", 500).returncode, 0)
+        self.assertEqual(
+            self.pay(second_bill, "r2", 200, customer_id="c2", plan="pro").returncode, 0
+        )
+
+        listing = self.invoke("payment", "list")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertEqual(len(listing.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(listing.stdout),
+            [
+                {"id": 1, "bill_id": first_bill, "customer_id": "c1",
+                 "plan": "basic", "reference": "r1", "amount_cents": 500,
+                 "payment_date": "2026-02-05", "status": "applied"},
+                {"id": 2, "bill_id": second_bill, "customer_id": "c2",
+                 "plan": "pro", "reference": "r2", "amount_cents": 200,
+                 "payment_date": "2026-02-05", "status": "applied"},
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
