@@ -389,5 +389,223 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.db_path.read_bytes(), before)
 
 
+class InvoiceTests(unittest.TestCase):
+    """End-to-end checks for invoice generation and per-subscription queries."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def create_subscription(
+        self,
+        customer_id: str = "c1",
+        plan: str = "basic",
+        start_date: str = "2026-01-01",
+        price_cents: int = 1000,
+        trial_days: int = 0,
+    ) -> None:
+        result = self.invoke(
+            "subscription", "create",
+            "--customer-id", customer_id,
+            "--plan", plan,
+            "--price-cents", str(price_cents),
+            "--start-date", start_date,
+            "--trial-days", str(trial_days),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def record_usage(self, usage_date: str, quantity: int, customer_id: str = "c1",
+                     plan: str = "basic") -> None:
+        result = self.invoke(
+            "usage", "record", "--customer-id", customer_id, "--plan", plan,
+            "--usage-date", usage_date, "--quantity", str(quantity),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def generate(self, *extra: str, customer_id: str = "c1",
+                 plan: str = "basic") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "invoice", "generate", "--customer-id", customer_id, "--plan", plan, *extra
+        )
+
+    def test_invoice_bills_non_trial_days_at_price_cents(self) -> None:
+        self.create_subscription(price_cents=990)
+        result = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "id": 1,
+                "subscription_id": 1,
+                "period_start": "2026-01-01",
+                "period_end": "2026-01-31",
+                "billed_days": 31,
+                "trial_days_in_period": 0,
+                "amount_cents": 31 * 990,
+                "usage_total": 0,
+            },
+        )
+
+    def test_invoice_applies_trial_window_inside_period(self) -> None:
+        # Trial covers Jan 1st through Jan 7th (7 consecutive days inclusive).
+        self.create_subscription(price_cents=1000, trial_days=7)
+        result = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["trial_days_in_period"], 7)
+        self.assertEqual(record["billed_days"], 24)
+        self.assertEqual(record["amount_cents"], 24000)
+
+    def test_trial_window_is_clipped_to_period_bounds(self) -> None:
+        # Trial Jan 1..7; period Jan 5..10 intersects on Jan 5, 6, 7.
+        self.create_subscription(price_cents=1000, trial_days=7)
+        result = self.generate("--start-date", "2026-01-05", "--end-date", "2026-01-10")
+        record = json.loads(result.stdout)
+        self.assertEqual(record["trial_days_in_period"], 3)
+        self.assertEqual(record["billed_days"], 3)
+        self.assertEqual(record["amount_cents"], 3000)
+
+    def test_trial_window_can_extend_before_period_start(self) -> None:
+        # Period starts before the subscription; only Jan 1..2 are trial days.
+        self.create_subscription(start_date="2026-01-01", price_cents=1000, trial_days=7)
+        result = self.generate("--start-date", "2025-12-30", "--end-date", "2026-01-02")
+        record = json.loads(result.stdout)
+        self.assertEqual(record["trial_days_in_period"], 2)
+        self.assertEqual(record["billed_days"], 2)
+        self.assertEqual(record["amount_cents"], 2000)
+
+    def test_usage_total_sums_records_per_day_with_zero_for_missing_days(self) -> None:
+        self.create_subscription(price_cents=500)
+        self.record_usage("2026-01-10", 5)
+        self.record_usage("2026-01-10", 3)
+        self.record_usage("2026-01-31", 2)
+        result = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-31")
+        record = json.loads(result.stdout)
+        self.assertEqual(record["usage_total"], 10)
+        self.assertEqual(record["billed_days"], 31)
+        self.assertEqual(record["amount_cents"], 15500)
+
+    def test_single_day_period(self) -> None:
+        self.create_subscription(price_cents=1000, trial_days=7)
+        trial_day = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-01")
+        self.assertEqual(json.loads(trial_day.stdout)["billed_days"], 0)
+        self.assertEqual(json.loads(trial_day.stdout)["amount_cents"], 0)
+        self.assertEqual(json.loads(trial_day.stdout)["trial_days_in_period"], 1)
+
+        billed_day = self.generate("--start-date", "2026-01-08", "--end-date", "2026-01-08")
+        self.assertEqual(json.loads(billed_day.stdout)["billed_days"], 1)
+        self.assertEqual(json.loads(billed_day.stdout)["amount_cents"], 1000)
+        self.assertEqual(json.loads(billed_day.stdout)["trial_days_in_period"], 0)
+
+    def test_duplicate_period_is_rejected_without_writing(self) -> None:
+        self.create_subscription(price_cents=990)
+        first = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-31")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_id = json.loads(first.stdout)["id"]
+
+        duplicate = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-31")
+        self.assertEqual(duplicate.returncode, 3)
+        self.assertIn("duplicate", duplicate.stderr)
+        self.assertEqual(duplicate.stdout, "")
+
+        listing = self.invoke("invoice", "list", "--customer-id", "c1", "--plan", "basic")
+        records = json.loads(listing.stdout)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["id"], first_id)
+
+        # The rejected attempt must not consume an invoice id.
+        other = self.generate("--start-date", "2026-02-01", "--end-date", "2026-02-28")
+        self.assertEqual(json.loads(other.stdout)["id"], first_id + 1)
+
+    def test_invalid_dates_exit_2_without_writing(self) -> None:
+        self.create_subscription()
+        bad_start = self.generate("--start-date", "2026-02-30", "--end-date", "2026-03-01")
+        self.assertEqual(bad_start.returncode, 2)
+        self.assertEqual(bad_start.stdout, "")
+
+        bad_end = self.generate("--start-date", "2026-01-01", "--end-date", "not-a-date")
+        self.assertEqual(bad_end.returncode, 2)
+        self.assertEqual(bad_end.stdout, "")
+
+        inverted = self.generate("--start-date", "2026-01-12", "--end-date", "2026-01-10")
+        self.assertEqual(inverted.returncode, 2)
+        self.assertEqual(inverted.stdout, "")
+
+        listing = self.invoke("invoice", "list", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(json.loads(listing.stdout), [])
+
+    def test_unknown_subscription_exits_4(self) -> None:
+        self.create_subscription()
+        result = self.generate(
+            "--start-date", "2026-01-01", "--end-date", "2026-01-31",
+            customer_id="ghost", plan="basic",
+        )
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("no subscription", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        listing = self.invoke("invoice", "list", "--customer-id", "ghost", "--plan", "basic")
+        self.assertEqual(listing.returncode, 4)
+        self.assertEqual(listing.stdout, "")
+
+    def test_list_is_scoped_and_sorted_by_id(self) -> None:
+        self.create_subscription("c1", "basic", price_cents=100)
+        self.create_subscription("c2", "pro", price_cents=200)
+
+        c2_jan = self.invoke(
+            "invoice", "generate", "--customer-id", "c2", "--plan", "pro",
+            "--start-date", "2026-01-01", "--end-date", "2026-01-31",
+        )
+        c1_jan = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-31")
+        c1_feb = self.generate("--start-date", "2026-02-01", "--end-date", "2026-02-28")
+        self.assertEqual(json.loads(c2_jan.stdout)["id"], 1)
+        self.assertEqual(json.loads(c1_jan.stdout)["id"], 2)
+        self.assertEqual(json.loads(c1_feb.stdout)["id"], 3)
+
+        c1_list = self.invoke("invoice", "list", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(c1_list.returncode, 0, c1_list.stderr)
+        c1_records = json.loads(c1_list.stdout)
+        self.assertEqual([r["id"] for r in c1_records], [2, 3])
+        self.assertEqual(len(c1_list.stdout.splitlines()), 1)
+        self.assertEqual(
+            c1_records[0],
+            {
+                "id": 2,
+                "subscription_id": 1,
+                "period_start": "2026-01-01",
+                "period_end": "2026-01-31",
+                "billed_days": 31,
+                "trial_days_in_period": 0,
+                "amount_cents": 3100,
+                "usage_total": 0,
+            },
+        )
+
+        c2_list = self.invoke("invoice", "list", "--customer-id", "c2", "--plan", "pro")
+        self.assertEqual([r["id"] for r in json.loads(c2_list.stdout)], [1])
+
+    def test_invoice_with_any_usage_history_works(self) -> None:
+        # Invoice generation must work when no usage command ever ran.
+        self.create_subscription(price_cents=100)
+        result = self.generate("--start-date", "2026-01-01", "--end-date", "2026-01-07")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["usage_total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
