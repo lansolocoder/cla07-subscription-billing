@@ -100,7 +100,7 @@ def record(
     connection = _payment_connection()
     try:
         bill = connection.execute(
-            "SELECT id FROM bills WHERE id = ? AND customer_id = ? AND plan = ?",
+            "SELECT id, status FROM bills WHERE id = ? AND customer_id = ? AND plan = ?",
             (bill_id, customer_id, plan),
         ).fetchone()
         if bill is None:
@@ -110,6 +110,8 @@ def record(
                 file=sys.stderr,
             )
             return 4
+        if bill[1] == "voided":
+            return _fail(f"cannot record a payment for a voided bill: bill_id={bill_id}")
 
         try:
             cursor = connection.execute(
@@ -191,6 +193,20 @@ def _settlement(
     return lines, applied_total, over_collected
 
 
+def _summarize(total_cents: int, rows: list[tuple]) -> tuple[list[dict], int, str]:
+    """Derive the reconciliation lines, applied total and summary status."""
+    lines, paid_cents, over_collected = _settlement(total_cents, rows)
+    if not rows:
+        status = "open"
+    elif paid_cents < total_cents:
+        status = "open"
+    elif over_collected:
+        status = "partial"
+    else:
+        status = "paid"
+    return lines, paid_cents, status
+
+
 def match(bill_id: int) -> int:
     """Reconcile registered payments against one bill (read-only, idempotent).
 
@@ -201,13 +217,14 @@ def match(bill_id: int) -> int:
     connection = _payment_connection()
     try:
         bill = connection.execute(
-            "SELECT id, total_cents FROM bills WHERE id = ?",
+            "SELECT id, total_cents, status FROM bills WHERE id = ?",
             (bill_id,),
         ).fetchone()
         if bill is None:
             print(f"billing-ledger: no bill found for bill_id={bill_id}", file=sys.stderr)
             return 4
         total_cents = int(bill[1])
+        bill_status = bill[2]
         rows = connection.execute(
             "SELECT bill_id, reference, amount_cents FROM payments"
             " WHERE bill_id = ? ORDER BY id ASC",
@@ -216,18 +233,11 @@ def match(bill_id: int) -> int:
     finally:
         connection.close()
 
-    lines, paid_cents, over_collected = _settlement(total_cents, list(rows))
+    lines, paid_cents, status = _summarize(total_cents, list(rows))
+    if bill_status == "voided":
+        status = "voided"
     for line in lines:
         print(json.dumps(line, ensure_ascii=False, separators=(",", ":")))
-
-    if not rows:
-        status = "open"
-    elif paid_cents < total_cents:
-        status = "open"
-    elif over_collected:
-        status = "partial"
-    else:
-        status = "paid"
 
     summary = {
         "bill_id": bill_id,

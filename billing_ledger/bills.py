@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS bills (
 )
 """
 
+_ADJUSTMENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS bill_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    reference TEXT NOT NULL UNIQUE,
+    FOREIGN KEY (bill_id) REFERENCES bills (id)
+)
+"""
+
 _USAGE_CENTS_PER_UNIT = 10
 
 
@@ -43,9 +55,11 @@ def _fail(message: str) -> int:
 
 def _bill_connection() -> sqlite3.Connection:
     # _usage_connection already creates the subscriptions and usage tables;
-    # add the bills table in the same database so all data shares one file.
+    # add the bills and bill_adjustments tables in the same database so all
+    # data shares one file.
     connection = _usage_connection()
     connection.execute(_SCHEMA)
+    connection.execute(_ADJUSTMENT_SCHEMA)
     return connection
 
 
@@ -215,4 +229,153 @@ def list_bills(customer_id: str, plan: str) -> int:
         connection.close()
 
     print(json.dumps([_view(row) for row in rows], ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def _payment_status(connection: sqlite3.Connection, bill_id: int, total_cents: int) -> str:
+    """Derive the open/paid/partial status from the registered payments.
+
+    Uses the same read-only settlement computation as ``payment match`` so
+    the persisted status always agrees with the next match summary line.
+    """
+    from . import payments
+
+    connection.execute(payments._SCHEMA)
+    rows = connection.execute(
+        "SELECT bill_id, reference, amount_cents FROM payments"
+        " WHERE bill_id = ? ORDER BY id ASC",
+        (bill_id,),
+    ).fetchall()
+    _, _, status = payments._summarize(total_cents, list(rows))
+    return status
+
+
+def adjust(
+    customer_id: str,
+    plan: str,
+    bill_id: int,
+    kind: str,
+    amount_cents: int,
+    reason: str,
+    reference: str,
+) -> int:
+    """Append or replace the single effective adjustment of one bill.
+
+    A credit subtracts from and a debit adds to the original total
+    (``base_cents + usage_cents``); the adjusted total is floored at zero.
+    At most one adjustment is effective per bill: repeating the command
+    overwrites the previous adjustment and recomputes the total and the
+    payment-derived status. The adjustment reference is globally unique: a
+    duplicate is rejected (exit 5) without overwriting. Voided bills
+    reject adjustments (exit 2) without writing.
+    """
+    if not customer_id:
+        return _fail("--customer-id must not be empty")
+    if not plan:
+        return _fail("--plan must not be empty")
+    if kind not in ("credit", "debit"):
+        return _fail(f"--kind must be credit or debit: {kind}")
+    if amount_cents <= 0:
+        return _fail("--amount-cents must be a positive integer")
+    if not reason:
+        return _fail("--reason must not be empty")
+    if not reference:
+        return _fail("--reference must not be empty")
+
+    connection = _bill_connection()
+    try:
+        bill = connection.execute(
+            "SELECT base_cents, usage_cents, status FROM bills"
+            " WHERE id = ? AND customer_id = ? AND plan = ?",
+            (bill_id, customer_id, plan),
+        ).fetchone()
+        if bill is None:
+            print(
+                "billing-ledger: no bill found for"
+                f" bill_id={bill_id} customer_id={customer_id} plan={plan}",
+                file=sys.stderr,
+            )
+            return 4
+        base_cents, usage_cents, status = int(bill[0]), int(bill[1]), bill[2]
+        if status == "voided":
+            return _fail(f"cannot adjust a voided bill: bill_id={bill_id}")
+
+        delta = amount_cents if kind == "debit" else -amount_cents
+        total_cents = max(0, base_cents + usage_cents + delta)
+        new_status = _payment_status(connection, bill_id, total_cents)
+        try:
+            connection.execute(
+                "INSERT INTO bill_adjustments"
+                " (bill_id, kind, amount_cents, reason, reference)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (bill_id, kind, amount_cents, reason, reference),
+            )
+            connection.execute(
+                "UPDATE bills SET total_cents = ?, status = ? WHERE id = ?",
+                (total_cents, new_status, bill_id),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            print(
+                f"billing-ledger: duplicate adjustment reference: {reference}",
+                file=sys.stderr,
+            )
+            return 5
+    finally:
+        connection.close()
+
+    record = {
+        "bill_id": bill_id,
+        "kind": kind,
+        "amount_cents": amount_cents,
+        "reference": reference,
+        "reason": reason,
+        "base_cents": base_cents,
+        "usage_cents": usage_cents,
+        "total_cents": total_cents,
+        "status": new_status,
+    }
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def void(customer_id: str, plan: str, bill_id: int) -> int:
+    """Void an open bill, leaving every amount component unchanged.
+
+    Only a bill whose status is ``open`` can be voided; anything else
+    (including an already voided bill) is rejected (exit 2) without
+    writing. A voided bill also rejects payments and adjustments, while
+    ``payment match`` keeps reporting it read-only with summary status
+    ``voided``.
+    """
+    if not customer_id:
+        return _fail("--customer-id must not be empty")
+    if not plan:
+        return _fail("--plan must not be empty")
+
+    connection = _bill_connection()
+    try:
+        bill = connection.execute(
+            "SELECT status FROM bills WHERE id = ? AND customer_id = ? AND plan = ?",
+            (bill_id, customer_id, plan),
+        ).fetchone()
+        if bill is None:
+            print(
+                "billing-ledger: no bill found for"
+                f" bill_id={bill_id} customer_id={customer_id} plan={plan}",
+                file=sys.stderr,
+            )
+            return 4
+        if bill[0] != "open":
+            return _fail(
+                f"only an open bill can be voided: bill_id={bill_id} status={bill[0]}"
+            )
+        connection.execute("UPDATE bills SET status = 'voided' WHERE id = ?", (bill_id,))
+        connection.commit()
+    finally:
+        connection.close()
+
+    record = {"bill_id": bill_id, "status": "voided"}
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
     return 0

@@ -172,6 +172,43 @@ python3 -m billing_ledger bill list --customer-id c1 --plan basic
 - `--period-start` / `--period-end` 须为合法 `YYYY-MM-DD` 闭区间，起始晚于结束为参数错误
   （stderr、退出码 2，不写入数据）；找不到匹配的订阅组合为 stderr、退出码 4。
 
+## 账单调整
+
+```bash
+# 为账单追加或覆盖一条调整（credit 减、debit 加），stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger bill adjust --customer-id c1 --plan basic --bill-id 1 \
+  --kind credit --amount-cents 200 --reason "late usage" --reference adj-1
+# {"bill_id":1,"kind":"credit","amount_cents":200,"reference":"adj-1",
+#  "reason":"late usage","base_cents":990,"usage_cents":80,
+#  "total_cents":870,"status":"open"}
+```
+
+- 每张账单至多一条有效调整：重复 `bill adjust` 覆盖上一条并按原始金额
+  （`base_cents + usage_cents`）重算；`total_cents` 为原 `total_cents` 与调整额的
+  代数和（credit 为减、debit 为加），不得小于 0。
+- 调整后 `status` 沿用 `payment match` 的判定（`open`、`paid` 或 `partial`），
+  与随后 `payment match` 的汇总行一致；`bill list` 的金额与状态随之更新。
+- `--kind` 仅取 `credit` 或 `debit`；`--amount-cents` 须为正整数；`--reason` 与
+  `--reference` 须非空：参数非法时 stderr、退出码 2，不写入数据。
+- `--reference` 须全局唯一：重复登记同一凭证号时 stderr、退出码 5，不覆盖既有调整。
+- 账单不存在或不属于给定 `--customer-id` 与 `--plan` 时 stderr、退出码 4；
+  已撤销（`voided`）的账单拒绝调整（stderr、退出码 2），均不写入数据。
+
+## 账单撤销
+
+```bash
+# 撤销 open 状态的账单，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger bill void --customer-id c1 --plan basic --bill-id 1
+# {"bill_id":1,"status":"voided"}
+```
+
+- 仅 `status` 为 `open` 的账单允许撤销；撤销后 `status` 为 `voided`，
+  `base_cents`、`usage_cents`、`total_cents` 各分量不变。
+- 对 `voided` 账单再次 `bill void`、`payment record` 或 `bill adjust` 一律拒绝
+  （stderr、退出码 2，不写入数据）；已登记的收款保持原样。
+- `payment match` 对 `voided` 账单照常只读输出逐笔核销行，汇总行的 `status` 为 `voided`。
+- 账单不存在或不属于给定 `--customer-id` 与 `--plan` 时 stderr、退出码 4。
+
 ## 收款登记
 
 ```bash
@@ -190,6 +227,7 @@ python3 -m billing_ledger payment record \
   参数或日期非法时 stderr、退出码 2，不写入数据。
 - `--reference` 须非空且全局唯一（跨全部账单）：重复登记同一凭证号时 stderr、
   退出码 5，不覆盖既有收款、不写入数据。
+- 已撤销（`voided`）的账单拒绝收款：stderr、退出码 2，不写入数据。
 
 ## 收款结清核对
 
@@ -210,6 +248,7 @@ python3 -m billing_ledger payment match --bill-id 1
   存在结清后的超收收款为 `partial`（`paid_cents` 仍等于 `total_cents`）。
 - 账单不存在时 stderr、退出码 4；该账单没有任何收款时仅输出汇总一行，
   `paid_cents` 为 0、`status` 为 `open`。
+- 已撤销（`voided`）的账单照常只读输出逐笔核销行，汇总行的 `status` 为 `voided`。
 
 ## 收款查询
 
@@ -222,5 +261,5 @@ python3 -m billing_ledger payment list
 
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
 退出码约定：参数或日期非法为 2（不写入数据）；重复登记同一 `customer_id` 与 `plan`
-组合为 3（不覆盖已有订阅）；找不到匹配的订阅或账单为 4；收款凭证号 `--reference`
-重复登记为 5（不覆盖既有收款）；成功为 0。
+组合为 3（不覆盖已有订阅）；找不到匹配的订阅或账单为 4；收款或调整凭证号
+`--reference` 重复登记为 5（不覆盖既有记录）；成功为 0。
