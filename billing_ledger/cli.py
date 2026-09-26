@@ -137,6 +137,29 @@ def _build_parser() -> argparse.ArgumentParser:
     bill_list.add_argument("--customer-id", required=True, help="客户标识，非空.")
     bill_list.add_argument("--plan", required=True, help="订阅计划，非空.")
 
+    adjust = bill_subparsers.add_parser(
+        "adjust", help="为账单追加一条调整（credit 减、debit 加）并重算总额与状态；重复调整覆盖上一条."
+    )
+    adjust.add_argument("--bill-id", required=True, type=int, help="账单号，正整数.")
+    adjust.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    adjust.add_argument("--plan", required=True, help="订阅计划，非空.")
+    adjust.add_argument("--kind", required=True, help="调整类型：credit（减）或 debit（加）.")
+    adjust.add_argument(
+        "--amount-cents",
+        required=True,
+        type=_positive_int,
+        help="调整金额，单位分，正整数.",
+    )
+    adjust.add_argument("--reason", required=True, help="调整原因，非空.")
+    adjust.add_argument("--reference", required=True, help="调整凭证号，全局唯一、非空.")
+
+    void = bill_subparsers.add_parser(
+        "void", help="撤销一笔 open 账单，状态变为 voided，金额不变."
+    )
+    void.add_argument("--bill-id", required=True, type=int, help="账单号，正整数.")
+    void.add_argument("--customer-id", required=True, help="客户标识，非空.")
+    void.add_argument("--plan", required=True, help="订阅计划，非空.")
+
     payment = subparsers.add_parser("payment", help="收款登记与账单结清核对.")
     payment_subparsers = payment.add_subparsers(dest="payment_command")
 
@@ -253,6 +276,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.bill_command == "list":
             return bills.list_bills(customer_id=args.customer_id, plan=args.plan)
+        if args.bill_command == "adjust":
+            return bills.adjust(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                bill_id=args.bill_id,
+                kind=args.kind,
+                amount_cents=args.amount_cents,
+                reason=args.reason,
+                reference=args.reference,
+            )
+        if args.bill_command == "void":
+            return bills.void(
+                customer_id=args.customer_id,
+                plan=args.plan,
+                bill_id=args.bill_id,
+            )
 
     if args.command == "payment":
         if args.payment_command == "record":

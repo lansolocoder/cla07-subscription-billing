@@ -19,7 +19,7 @@ import json
 import sqlite3
 import sys
 
-from .bills import _bill_connection
+from .bills import _bill_connection, _derive_status, _settlement
 from .subscriptions import _parse_start_date
 
 
@@ -79,8 +79,8 @@ def record(
 ) -> int:
     """Register one payment for an existing bill.
 
-    The bill must exist and belong to the given customer and plan (exit 4).
-    The payment reference is globally unique; a duplicate reference is
+    The bill must exist and belong to the given customer and plan (exit 4)
+    and must not be voided (exit 2). The payment reference is globally unique; a duplicate reference is
     rejected (exit 5) without overwriting the prior registration. Invalid
     dates and non-positive amounts reject the registration (exit 2) before
     any write.
@@ -100,7 +100,7 @@ def record(
     connection = _payment_connection()
     try:
         bill = connection.execute(
-            "SELECT id FROM bills WHERE id = ? AND customer_id = ? AND plan = ?",
+            "SELECT id, status FROM bills WHERE id = ? AND customer_id = ? AND plan = ?",
             (bill_id, customer_id, plan),
         ).fetchone()
         if bill is None:
@@ -110,6 +110,8 @@ def record(
                 file=sys.stderr,
             )
             return 4
+        if bill[1] == "voided":
+            return _fail(f"cannot record a payment for a voided bill: bill_id={bill_id}")
 
         try:
             cursor = connection.execute(
@@ -143,71 +145,25 @@ def record(
     return 0
 
 
-def _settlement(
-    total_cents: int, rows: list[tuple]
-) -> tuple[list[dict], int, bool]:
-    """Apply payments in order and derive per-payment reconciliation lines.
-
-    Returns the lines, the total actually applied and whether any payment
-    arrived after the bill was already settled (over-collection).
-
-    Each payment applies at most the remaining balance: the payment whose
-    cumulative applied amount reaches ``total_cents`` settles the bill (its
-    excess counts only up to exact settlement); every later payment applies
-    nothing and is ``overpaid``. If the running total never reaches the bill
-    total, each effective payment that fails to settle is ``underpaid`` (in
-    particular the final payment keeps the bill open).
-    """
-    lines: list[dict] = []
-    applied_total = 0
-    settled = False
-    over_collected = False
-    for row in rows:
-        bill_id = int(row[0])
-        reference = row[1]
-        amount = int(row[2])
-        if settled:
-            applied = 0
-            result = "overpaid"
-            over_collected = True
-        else:
-            remaining = total_cents - applied_total
-            applied = min(amount, remaining)
-            applied_total += applied
-            if applied_total >= total_cents:
-                settled = True
-                result = "settled"
-            else:
-                result = "underpaid"
-        lines.append(
-            {
-                "bill_id": bill_id,
-                "reference": reference,
-                "amount_cents": amount,
-                "applied_cents": applied,
-                "result": result,
-            }
-        )
-    return lines, applied_total, over_collected
-
-
 def match(bill_id: int) -> int:
     """Reconcile registered payments against one bill (read-only, idempotent).
 
     Prints one reconciliation line per payment in registration order, then
     one summary line. Re-running the command prints the identical output
-    and never accumulates applications twice.
+    and never accumulates applications twice. A voided bill still reports
+    its lines as usual; its summary status stays ``voided``.
     """
     connection = _payment_connection()
     try:
         bill = connection.execute(
-            "SELECT id, total_cents FROM bills WHERE id = ?",
+            "SELECT id, total_cents, status FROM bills WHERE id = ?",
             (bill_id,),
         ).fetchone()
         if bill is None:
             print(f"billing-ledger: no bill found for bill_id={bill_id}", file=sys.stderr)
             return 4
         total_cents = int(bill[1])
+        bill_status = bill[2]
         rows = connection.execute(
             "SELECT bill_id, reference, amount_cents FROM payments"
             " WHERE bill_id = ? ORDER BY id ASC",
@@ -216,18 +172,14 @@ def match(bill_id: int) -> int:
     finally:
         connection.close()
 
-    lines, paid_cents, over_collected = _settlement(total_cents, list(rows))
+    lines, paid_cents, _ = _settlement(total_cents, list(rows))
     for line in lines:
         print(json.dumps(line, ensure_ascii=False, separators=(",", ":")))
 
-    if not rows:
-        status = "open"
-    elif paid_cents < total_cents:
-        status = "open"
-    elif over_collected:
-        status = "partial"
+    if bill_status == "voided":
+        status = "voided"
     else:
-        status = "paid"
+        status = _derive_status(total_cents, list(rows))
 
     summary = {
         "bill_id": bill_id,

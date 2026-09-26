@@ -172,6 +172,42 @@ python3 -m billing_ledger bill list --customer-id c1 --plan basic
 - `--period-start` / `--period-end` 须为合法 `YYYY-MM-DD` 闭区间，起始晚于结束为参数错误
   （stderr、退出码 2，不写入数据）；找不到匹配的订阅组合为 stderr、退出码 4。
 
+## 账单调整
+
+```bash
+# 为账单追加一条调整：credit 为减、debit 为加，stdout 输出一行紧凑 JSON，退出码 0
+python3 -m billing_ledger bill adjust \
+  --customer-id c1 --plan basic --bill-id 1 \
+  --kind credit --amount-cents 200 --reason "late usage" --reference adj-1
+# {"bill_id":1,"kind":"credit","amount_cents":200,"reference":"adj-1",
+#  "reason":"late usage","base_cents":990,"usage_cents":80,
+#  "total_cents":870,"status":"open"}
+```
+
+- 每张账单至多一条有效调整：重复 `bill adjust` 覆盖上一条并按原始
+  `base_cents + usage_cents` 与最新调整额重新计算 `total_cents`（代数和，不小于 0）。
+- 调整后 `status` 按 payment match 的汇总规则重算（`open` / `paid` / `partial`），
+  与随后 `payment match --bill-id` 的汇总行一致；`bill list` 的金额与状态随之更新。
+- `--reference` 须非空且全局唯一（跨全部调整）：重复时 stderr、退出码 5，不覆盖、不写入。
+- `--kind` 非 `credit`/`debit`、`--amount-cents` 非正整数、`--reason` 或 `--reference`
+  为空：stderr、退出码 2，不写入数据。
+- 账单不存在或不属于给定的 `--customer-id` 与 `--plan`：stderr、退出码 4；
+  已 `voided` 的账单拒绝调整：stderr、退出码 2，均不写入数据。
+
+## 账单撤销
+
+```bash
+# 撤销一笔 open 账单：金额各分量不变，状态变为 voided
+python3 -m billing_ledger bill void --customer-id c1 --plan basic --bill-id 1
+# {"bill_id":1,"status":"voided"}
+```
+
+- 仅 `status` 为 `open` 的账单允许撤销；对已 `voided`、`paid` 或 `partial` 的账单
+  再次撤销：stderr、退出码 2，不写入数据。
+- 撤销后该账单拒绝 `payment record` 与 `bill adjust`（stderr、退出码 2，不写入数据）；
+  已有收款保持原样，`payment match` 对 voided 账单照常只读输出，汇总 `status` 为 `voided`。
+- 账单不存在或不属于给定的 `--customer-id` 与 `--plan`：stderr、退出码 4。
+
 ## 收款登记
 
 ```bash
@@ -222,5 +258,5 @@ python3 -m billing_ledger payment list
 
 所有成功与查询输出均写入 stdout 且为单行 JSON；错误信息写入 stderr。
 退出码约定：参数或日期非法为 2（不写入数据）；重复登记同一 `customer_id` 与 `plan`
-组合为 3（不覆盖已有订阅）；找不到匹配的订阅或账单为 4；收款凭证号 `--reference`
-重复登记为 5（不覆盖既有收款）；成功为 0。
+组合为 3（不覆盖已有订阅）；找不到匹配的订阅或账单为 4；收款或调整的 `--reference`
+重复登记为 5（不覆盖既有记录）；成功为 0。

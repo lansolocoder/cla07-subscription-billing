@@ -1411,5 +1411,301 @@ class PaymentTests(unittest.TestCase):
         )
 
 
+class BillAdjustmentTests(unittest.TestCase):
+    """End-to-end checks for bill adjust and bill void."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "ledger.db"
+        self.env = {**os.environ, "BILLING_LEDGER_DB": str(self.db_path)}
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "billing_ledger", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.env,
+        )
+
+    def setup_bill(self) -> int:
+        # 990 base + 8 usage units * 10 cents = total_cents 1070.
+        result = self.invoke(
+            "subscription", "create",
+            "--customer-id", "c1", "--plan", "basic",
+            "--price-cents", "990", "--start-date", "2026-01-01",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for quantity in (5, 3):
+            result = self.invoke(
+                "usage", "record", "--customer-id", "c1", "--plan", "basic",
+                "--usage-date", "2026-01-10", "--quantity", str(quantity),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.invoke(
+            "bill", "generate", "--customer-id", "c1", "--plan", "basic",
+            "--period-start", "2026-01-01", "--period-end", "2026-01-31",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return int(json.loads(result.stdout)["id"])
+
+    def adjust(self, bill_id: int, *extra: str, kind: str = "credit",
+               amount: int = 200, reason: str = "late usage",
+               reference: str = "adj-1", customer_id: str = "c1",
+               plan: str = "basic") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "bill", "adjust",
+            "--customer-id", customer_id, "--plan", plan,
+            "--bill-id", str(bill_id),
+            "--kind", kind, "--amount-cents", str(amount),
+            "--reason", reason, "--reference", reference,
+            *extra,
+        )
+
+    def void(self, bill_id: int, customer_id: str = "c1",
+             plan: str = "basic") -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "bill", "void",
+            "--customer-id", customer_id, "--plan", plan,
+            "--bill-id", str(bill_id),
+        )
+
+    def pay(self, bill_id: int, reference: str,
+            amount: int) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "payment", "record",
+            "--customer-id", "c1", "--plan", "basic",
+            "--bill-id", str(bill_id),
+            "--amount-cents", str(amount),
+            "--payment-date", "2026-02-05",
+            "--reference", reference,
+        )
+
+    def list_bills(self) -> list[dict]:
+        result = self.invoke("bill", "list", "--customer-id", "c1", "--plan", "basic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def match_summary(self, bill_id: int) -> dict:
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout.splitlines()[-1])
+
+    def test_adjust_credit_outputs_one_json_line(self) -> None:
+        bill_id = self.setup_bill()
+        result = self.adjust(bill_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"bill_id": bill_id, "kind": "credit", "amount_cents": 200,
+             "reference": "adj-1", "reason": "late usage",
+             "base_cents": 990, "usage_cents": 80,
+             "total_cents": 870, "status": "open"},
+        )
+        self.assertEqual(result.stderr, "")
+
+        bill = self.list_bills()[0]
+        self.assertEqual(bill["total_cents"], 870)
+        self.assertEqual(bill["base_cents"], 990)
+        self.assertEqual(bill["usage_cents"], 80)
+        self.assertEqual(bill["status"], "open")
+
+    def test_adjust_debit_adds_to_total(self) -> None:
+        bill_id = self.setup_bill()
+        result = self.adjust(bill_id, kind="debit", amount=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["total_cents"], 1100)
+
+    def test_adjust_credit_never_drops_below_zero(self) -> None:
+        bill_id = self.setup_bill()
+        result = self.adjust(bill_id, amount=999999)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["total_cents"], 0)
+        self.assertEqual(self.list_bills()[0]["total_cents"], 0)
+
+    def test_repeated_adjust_overwrites_and_recomputes(self) -> None:
+        bill_id = self.setup_bill()
+        first = self.adjust(bill_id, kind="credit", amount=200, reference="adj-1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = self.adjust(bill_id, kind="debit", amount=50, reference="adj-2")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        # Recomputed from the original 1070, not from the adjusted 870.
+        self.assertEqual(json.loads(second.stdout)["total_cents"], 1120)
+        self.assertEqual(self.list_bills()[0]["total_cents"], 1120)
+
+        # The overwritten reference stays registered and cannot be reused.
+        reused = self.adjust(bill_id, kind="credit", amount=10, reference="adj-1")
+        self.assertEqual(reused.returncode, 5)
+        self.assertEqual(reused.stdout, "")
+        self.assertEqual(self.list_bills()[0]["total_cents"], 1120)
+
+    def test_adjust_duplicate_reference_exits_5(self) -> None:
+        bill_id = self.setup_bill()
+        self.assertEqual(self.adjust(bill_id).returncode, 0)
+
+        duplicate = self.adjust(bill_id, reference="adj-1")
+        self.assertEqual(duplicate.returncode, 5)
+        self.assertIn("adj-1", duplicate.stderr)
+        self.assertEqual(duplicate.stdout, "")
+        self.assertEqual(self.list_bills()[0]["total_cents"], 870)
+
+    def test_adjust_validates_arguments(self) -> None:
+        bill_id = self.setup_bill()
+
+        bad_kind = self.adjust(bill_id, kind="refund")
+        self.assertEqual(bad_kind.returncode, 2)
+        self.assertEqual(bad_kind.stdout, "")
+
+        zero_amount = self.adjust(bill_id, amount=0)
+        self.assertEqual(zero_amount.returncode, 2)
+        self.assertEqual(zero_amount.stdout, "")
+
+        empty_reason = self.adjust(bill_id, reason="")
+        self.assertEqual(empty_reason.returncode, 2)
+        self.assertEqual(empty_reason.stdout, "")
+
+        empty_reference = self.adjust(bill_id, reference="")
+        self.assertEqual(empty_reference.returncode, 2)
+        self.assertEqual(empty_reference.stdout, "")
+
+        self.assertEqual(self.list_bills()[0]["total_cents"], 1070)
+
+    def test_adjust_unknown_or_mismatched_bill_exits_4(self) -> None:
+        bill_id = self.setup_bill()
+
+        missing = self.adjust(999)
+        self.assertEqual(missing.returncode, 4)
+        self.assertIn("no bill", missing.stderr)
+        self.assertEqual(missing.stdout, "")
+
+        wrong_customer = self.adjust(bill_id, customer_id="ghost")
+        self.assertEqual(wrong_customer.returncode, 4)
+        self.assertEqual(wrong_customer.stdout, "")
+
+        wrong_plan = self.adjust(bill_id, plan="pro")
+        self.assertEqual(wrong_plan.returncode, 4)
+        self.assertEqual(wrong_plan.stdout, "")
+
+        self.assertEqual(self.list_bills()[0]["total_cents"], 1070)
+
+    def test_adjust_status_matches_payment_match_summary(self) -> None:
+        bill_id = self.setup_bill()
+        self.assertEqual(self.pay(bill_id, "r1", 500).returncode, 0)
+        self.assertEqual(self.pay(bill_id, "r2", 400).returncode, 0)
+
+        # Credit 200 -> total 870, settled exactly by the 900 of payments.
+        result = self.adjust(bill_id, kind="credit", amount=200)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        adjusted = json.loads(result.stdout)
+        self.assertEqual(adjusted["total_cents"], 870)
+        self.assertEqual(adjusted["status"], "paid")
+        summary = self.match_summary(bill_id)
+        self.assertEqual(summary["status"], adjusted["status"])
+        self.assertEqual(summary["total_cents"], 870)
+        self.assertEqual(self.list_bills()[0]["status"], "paid")
+
+        # Debit 200 -> total 1270, the 900 paid falls short of it.
+        second = self.adjust(bill_id, kind="debit", amount=200, reference="adj-2")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["status"], "open")
+        self.assertEqual(self.match_summary(bill_id)["status"], "open")
+
+        # Credit 170 -> total 900, exactly settled by the payments.
+        third = self.adjust(bill_id, kind="credit", amount=170, reference="adj-3")
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(json.loads(third.stdout)["status"], "paid")
+        self.assertEqual(self.match_summary(bill_id)["status"], "paid")
+        self.assertEqual(self.list_bills()[0]["status"], "paid")
+
+        # A late extra payment over-collects the settled bill: the next
+        # adjust recomputes to the same 900 total and reports partial.
+        self.assertEqual(self.pay(bill_id, "r3", 100).returncode, 0)
+        fourth = self.adjust(bill_id, kind="credit", amount=170, reference="adj-4")
+        self.assertEqual(fourth.returncode, 0, fourth.stderr)
+        self.assertEqual(json.loads(fourth.stdout)["status"], "partial")
+        self.assertEqual(self.match_summary(bill_id)["status"], "partial")
+        self.assertEqual(self.list_bills()[0]["status"], "partial")
+
+    def test_void_open_bill(self) -> None:
+        bill_id = self.setup_bill()
+        result = self.void(bill_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout), {"bill_id": bill_id, "status": "voided"}
+        )
+        self.assertEqual(result.stderr, "")
+
+        bill = self.list_bills()[0]
+        self.assertEqual(bill["status"], "voided")
+        self.assertEqual(bill["total_cents"], 1070)
+        self.assertEqual(bill["base_cents"], 990)
+        self.assertEqual(bill["usage_cents"], 80)
+
+    def test_void_rejects_non_open_bill(self) -> None:
+        bill_id = self.setup_bill()
+        self.assertEqual(self.void(bill_id).returncode, 0)
+
+        again = self.void(bill_id)
+        self.assertEqual(again.returncode, 2)
+        self.assertEqual(again.stdout, "")
+        self.assertEqual(self.list_bills()[0]["status"], "voided")
+
+    def test_void_unknown_or_mismatched_bill_exits_4(self) -> None:
+        bill_id = self.setup_bill()
+
+        missing = self.void(999)
+        self.assertEqual(missing.returncode, 4)
+        self.assertIn("no bill", missing.stderr)
+        self.assertEqual(missing.stdout, "")
+
+        wrong_customer = self.void(bill_id, customer_id="ghost")
+        self.assertEqual(wrong_customer.returncode, 4)
+        self.assertEqual(wrong_customer.stdout, "")
+
+        self.assertEqual(self.list_bills()[0]["status"], "open")
+
+    def test_voided_bill_rejects_payment_and_adjust(self) -> None:
+        bill_id = self.setup_bill()
+        self.assertEqual(self.pay(bill_id, "r1", 500).returncode, 0)
+        self.assertEqual(self.void(bill_id).returncode, 0)
+
+        payment = self.pay(bill_id, "r2", 100)
+        self.assertEqual(payment.returncode, 2)
+        self.assertEqual(payment.stdout, "")
+
+        adjustment = self.adjust(bill_id)
+        self.assertEqual(adjustment.returncode, 2)
+        self.assertEqual(adjustment.stdout, "")
+
+        bill = self.list_bills()[0]
+        self.assertEqual(bill["status"], "voided")
+        self.assertEqual(bill["total_cents"], 1070)
+
+    def test_payment_match_on_voided_bill_stays_read_only(self) -> None:
+        bill_id = self.setup_bill()
+        self.assertEqual(self.pay(bill_id, "r1", 500).returncode, 0)
+        self.assertEqual(self.void(bill_id).returncode, 0)
+
+        result = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["applied_cents"], 500)
+        self.assertEqual(
+            lines[-1],
+            {"bill_id": bill_id, "total_cents": 1070, "paid_cents": 500,
+             "status": "voided"},
+        )
+        # Read-only: a second run prints the identical output.
+        second = self.invoke("payment", "match", "--bill-id", str(bill_id))
+        self.assertEqual(second.stdout, result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
